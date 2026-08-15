@@ -814,6 +814,35 @@ int main() {
     rollback_physical->reset();
     rollback_instance->reset();
     assert(private_values.empty());
+
+    // Callback struct fields serialize to a trampoline + bundle userdata and
+    // round-trip the captured callable through the raw function pointer.
+    vk::DebugUtilsMessengerCreateInfoEXT callback_info{};
+    int callback_calls = 0;
+    callback_info.setUserCallback([&callback_calls](
+        VkDebugUtilsMessageSeverityFlagBitsEXT severity,
+        VkDebugUtilsMessageTypeFlagsEXT,
+        const VkDebugUtilsMessengerCallbackDataEXT* data) -> VkBool32 {
+        ++callback_calls;
+        return severity == VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT
+                   ? VK_FALSE : VK_TRUE;
+    });
+    vk::DebugUtilsMessengerCreateInfoEXT::CStruct callback_native{};
+    callback_info.to_cstruct(&callback_native);
+    assert(callback_native.value.pfnUserCallback != nullptr);
+    assert(callback_native.value.pUserData != nullptr);
+    auto result = callback_native.value.pfnUserCallback(
+        VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT,
+        VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT,
+        nullptr, callback_native.value.pUserData);
+    assert(callback_calls == 1 && result == VK_FALSE);
+    // Vulkan callbacks are persistent, not oneshot: a second invocation fires
+    // the same captured callable again.
+    result = callback_native.value.pfnUserCallback(
+        VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT,
+        VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT,
+        nullptr, callback_native.value.pUserData);
+    assert(callback_calls == 2 && result == VK_TRUE);
 }
 """,
         encoding="utf-8",

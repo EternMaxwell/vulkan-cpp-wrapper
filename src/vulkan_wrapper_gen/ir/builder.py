@@ -263,9 +263,15 @@ def _func_pointer(element: ET.Element, doc: str | None, protect: str | None) -> 
     proto = element.find("proto")
     if proto is not None:
         name = proto.findtext("name")
-        return_type = proto.findtext("type")
+        type_element = proto.find("type")
+        return_type = type_element.text if type_element is not None else None
         if not name or not return_type:
             raise RegistryError(f"funcpointer prototype is incomplete: {_text(element)!r}")
+        # The return declarator's trailing stars live outside the <type>
+        # element (e.g. <type>void</type>* for PFN_vkAllocationFunction); fold
+        # them back in so the reconstructed declarator and any generated
+        # trampoline carry the real return type.
+        return_type = (return_type + (type_element.tail or "")).strip()
         params = tuple(_param(param, frozenset()) for param in element.findall("param"))
         return FuncPointer(
             _generalize(name),
@@ -280,8 +286,10 @@ def _func_pointer(element: ET.Element, doc: str | None, protect: str | None) -> 
     if not name:
         raise RegistryError(f"funcpointer is missing its name: {_text(element)!r}")
     declaration = _text(element)
-    match = re.search(r"typedef\s+([A-Za-z_]\w*)\s*\(\s*VKAPI_PTR\s*\*", declaration)
-    return_type = match.group(1) if match else "void"
+    match = re.search(
+        r"typedef\s+([A-Za-z_]\w*(?:\s*\*)*)\s*\(\s*VKAPI_PTR\s*\*", declaration
+    )
+    return_type = match.group(1).strip() if match else "void"
     return FuncPointer(
         _generalize(name),
         name,

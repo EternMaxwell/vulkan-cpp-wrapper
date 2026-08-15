@@ -27,26 +27,6 @@ struct ValidationReporter {
     bool enabled = false;
 };
 
-inline VKAPI_ATTR VkBool32 VKAPI_CALL validationCallback(
-    VkDebugUtilsMessageSeverityFlagBitsEXT severity,
-    VkDebugUtilsMessageTypeFlagsEXT /*types*/,
-    const VkDebugUtilsMessengerCallbackDataEXT* data,
-    void* userData) noexcept {
-    auto* reporter = static_cast<ValidationReporter*>(userData);
-    const char* level = "info";
-    if (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) {
-        ++reporter->errors;
-        level = "error";
-    } else if (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) {
-        ++reporter->warnings;
-        level = "warning";
-    }
-    const char* id = data && data->pMessageIdName ? data->pMessageIdName : "";
-    const char* message = data && data->pMessage ? data->pMessage : "";
-    std::fprintf(stderr, "[validation:%s] %s%s%s\n", level, id, *id ? ": " : "", message);
-    return VK_FALSE;
-}
-
 // Enables VK_LAYER_KHRONOS_validation when the loader reports it and wires a
 // debug-utils messenger into the instance pNext so create/destroy-time
 // messages are captured too. Returns true when validation is active; the
@@ -84,8 +64,23 @@ inline bool enableValidationIfAvailable(const vk::Context& context,
         .setMessageType(vk::DebugUtilsMessageTypeFlagBitsEXT::General |
                         vk::DebugUtilsMessageTypeFlagBitsEXT::Validation |
                         vk::DebugUtilsMessageTypeFlagBitsEXT::Performance)
-        .setPfnUserCallback(validationCallback)
-        .setUserData(&reporter);
+        .setUserCallback([reporter_ptr = &reporter](
+                             VkDebugUtilsMessageSeverityFlagBitsEXT severity,
+                             VkDebugUtilsMessageTypeFlagsEXT /*types*/,
+                             const VkDebugUtilsMessengerCallbackDataEXT* data) -> VkBool32 {
+            const char* level = "info";
+            if (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) {
+                ++reporter_ptr->errors;
+                level = "error";
+            } else if (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) {
+                ++reporter_ptr->warnings;
+                level = "warning";
+            }
+            const char* id = data && data->pMessageIdName ? data->pMessageIdName : "";
+            const char* message = data && data->pMessage ? data->pMessage : "";
+            std::fprintf(stderr, "[validation:%s] %s%s%s\n", level, id, *id ? ": " : "", message);
+            return VK_FALSE;
+        });
     info.setNextInChain(messengerInfo);
     reporter.enabled = true;
     return true;

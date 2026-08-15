@@ -16,6 +16,7 @@ from .ir.model import (
     Command,
     Enum,
     EnumValue,
+    FuncPointer,
     Handle,
     IrRegistry,
     Param,
@@ -738,6 +739,79 @@ def _struct_member_names(struct: Struct) -> dict[str, str]:
     return result
 
 
+def _callback_groups(struct: Struct, ir: IrRegistry) -> tuple[tuple[str, tuple[Param, ...]], ...]:
+    """Group a struct's callback members by their userdata carrier field.
+
+    A callback is a funcpointer-typed member whose funcpointer type declares a
+    ``void*`` parameter named after one of the struct's own ``void*`` fields
+    (Vulkan's convention is the ``pUserData`` carrier). Returns one group per
+    carrier, keyed by the carrier member name. Funcpointer members without a
+    matching carrier (e.g. a plain ``PFN_vkGetInstanceProcAddr`` slot) are not
+    grouped and stay ordinary raw fields.
+    """
+    userdata_names = {
+        member.name
+        for member in struct.members
+        if member.type == "void" and member.pointer_depth == 1
+    }
+    groups: dict[str, list[Param]] = {}
+    for member in struct.members:
+        func_pointer = ir.func_pointers.get(member.type)
+        if func_pointer is None:
+            continue
+        for param in func_pointer.params:
+            if (
+                param.type == "void"
+                and param.pointer_depth == 1
+                and param.name in userdata_names
+            ):
+                groups.setdefault(param.name, []).append(member)
+                break
+    return tuple((name, tuple(members)) for name, members in groups.items())
+
+
+def _callback_field_name(member: Param) -> str:
+    """C++ field name for a callback member (strip the leading ``pfn`` prefix)."""
+    name = member.name[3:] if member.name.startswith("pfn") else member.name
+    return name[:1].lower() + name[1:]
+
+
+def _callback_userdata_param(func_pointer: FuncPointer, carrier: str) -> Param | None:
+    for param in func_pointer.params:
+        if param.type == "void" and param.pointer_depth == 1 and param.name == carrier:
+            return param
+    return None
+
+
+def _callback_callable_signature(func_pointer: FuncPointer, carrier: str) -> str:
+    """The ``std::function<Ret(Args...)>`` type a callback field stores.
+
+    Args is the funcpointer's native parameter list minus the userdata carrier
+    (which the generated trampoline consumes to recover the bundle).
+    """
+    userdata = _callback_userdata_param(func_pointer, carrier)
+    arguments = [
+        _native_type(param)
+        for param in func_pointer.params
+        if param is not userdata
+    ]
+    return f"std::function<{func_pointer.c_return_type or 'void'}({', '.join(arguments)})>"
+
+
+def _callback_trampoline_arguments(
+    func_pointer: FuncPointer, carrier: str
+) -> tuple[str, str]:
+    """The non-userdata native argument names and the userdata param name."""
+    arguments: list[str] = []
+    userdata_name = ""
+    for param in func_pointer.params:
+        if param.name == carrier:
+            userdata_name = param.name
+        else:
+            arguments.append(param.name)
+    return ", ".join(arguments), userdata_name
+
+
 def _cstruct_cache_lines(
     struct: Struct, ir: IrRegistry, config: GeneratorConfig
 ) -> list[str]:
@@ -818,6 +892,9 @@ def _emit_struct(
             struct.protect or struct.availability.protect,
         )
     field_names = _struct_member_names(struct)
+    callback_groups = _callback_groups(struct, ir)
+    callback_members = {member.name for _, members in callback_groups for member in members}
+    carrier_members = {carrier for carrier, _ in callback_groups}
     lines = [
         f"struct {name} {{",
         f"    using native_type = {_native_type_name(struct.name, ir)};",
@@ -829,6 +906,8 @@ def _emit_struct(
     lines.extend(["    };"])
     for member in struct.members:
         if member.name not in field_names:
+            continue
+        if member.name in callback_members or member.name in carrier_members:
             continue
         field_name = field_names[member.name]
         doc_prefix = _doc_comment(member.doc, config, "    ")
@@ -844,8 +923,24 @@ def _emit_struct(
             lines.append(
                 doc_prefix + f"    {member_type} {field_name}{_safe_default(member, member_type)};"
             )
+    if callback_groups:
+        # A refcounted bundle holds one std::function per callback. Struct
+        # copies share the bundle (shared_ptr), so captured state lives as long
+        # as any copy of the create-info or allocator, which is exactly the
+        # lifetime the native callback may still be invoked on.
+        lines.append("    struct Callbacks {")
+        for carrier, members in callback_groups:
+            for member in members:
+                func_pointer = ir.func_pointers[member.type]
+                field = _callback_field_name(member)
+                signature = _callback_callable_signature(func_pointer, carrier)
+                lines.append(f"        {signature} {field}{{}};")
+        lines.append("    };")
+        lines.append("    std::shared_ptr<Callbacks> callbacks_{};")
     for member in struct.members:
         if member.name in {"sType", "pNext"} or member.name not in field_names:
+            continue
+        if member.name in callback_members or member.name in carrier_members:
             continue
         field_name = field_names[member.name]
         method = field_name[:1].upper() + field_name[1:]
@@ -868,6 +963,19 @@ def _emit_struct(
         lines.append(
             f"    {name}&& set{method}({cpp} value) && {{ {field_name} = std::move(value);{count_stmt} return std::move(*this); }}"
         )
+    for carrier, members in callback_groups:
+        for member in members:
+            func_pointer = ir.func_pointers[member.type]
+            field = _callback_field_name(member)
+            signature = _callback_callable_signature(func_pointer, carrier)
+            method = field[:1].upper() + field[1:]
+            lazy = f"if (!callbacks_) callbacks_ = std::make_shared<Callbacks>(); callbacks_->{field} = std::move(value);"
+            lines.append(
+                f"    {name}& set{method}({signature} value) & {{ {lazy} return *this; }}"
+            )
+            lines.append(
+                f"    {name}&& set{method}({signature} value) && {{ {lazy} return std::move(*this); }}"
+            )
     if "pNext" in {member.name for member in struct.members}:
         # No compile-time "extends" constraint here: Vulkan validates the pNext
         # chain at runtime (validation layers / driver). This keeps the chain a
@@ -985,7 +1093,34 @@ def _emit_struct_impl(
         return ""
     name = _cpp_type(struct.name, ir, config)
     field_names = _struct_member_names(struct)
+    callback_groups = _callback_groups(struct, ir)
+    callback_members = {member.name for _, members in callback_groups for member in members}
+    carrier_members = {carrier for carrier, _ in callback_groups}
+    trampolines: list[str] = []
+    for carrier, members in callback_groups:
+        for member in members:
+            func_pointer = ir.func_pointers[member.type]
+            field = _callback_field_name(member)
+            ret = func_pointer.c_return_type or "void"
+            params = ", ".join(p.c_declaration for p in func_pointer.params)
+            args, userdata_name = _callback_trampoline_arguments(func_pointer, carrier)
+            trampoline_name = f"{name}_{field}_trampoline"
+            if ret == "void":
+                body = (
+                    f"    auto* callbacks = static_cast<{name}::Callbacks*>({userdata_name});\n"
+                    f"    if (callbacks && callbacks->{field}) callbacks->{field}({args});"
+                )
+            else:
+                body = (
+                    f"    auto* callbacks = static_cast<{name}::Callbacks*>({userdata_name});\n"
+                    f"    if (callbacks && callbacks->{field}) return callbacks->{field}({args});\n"
+                    "    return {};"
+                )
+            trampolines.append(
+                f"inline VKAPI_ATTR {ret} VKAPI_CALL {trampoline_name}({params}) {{\n{body}\n}}"
+            )
     lines = [
+        *trampolines,
         f"inline void {name}::to_cstruct(CStruct* output) const {{",
         "    if (!output) return;",
         "    output->value = {};",
@@ -995,6 +1130,13 @@ def _emit_struct_impl(
         target = f"output->value.{member.name}"
         field = field_names.get(member.name, member.name)
         array_sizes = re.findall(r"\[([^\]]+)\]", member.c_suffix)
+        if member.name in carrier_members:
+            lines.append(f"    {target} = callbacks_ ? callbacks_.get() : nullptr;")
+            continue
+        if member.name in callback_members:
+            cb_field = _callback_field_name(member)
+            lines.append(f"    {target} = {name}_{cb_field}_trampoline;")
+            continue
         if member.name == "pNext":
             lines.append(
                 f"    {target} = reinterpret_cast<decltype({target})>(const_cast<void*>(nextInChain.native()));"
@@ -1127,6 +1269,8 @@ def _emit_struct_impl(
         field = field_names.get(member.name, member.name)
         array_sizes = re.findall(r"\[([^\]]+)\]", member.c_suffix)
         if member.name == "pNext":
+            continue
+        if member.name in carrier_members or member.name in callback_members:
             continue
         if array_sizes:
             if category == "struct":
@@ -1267,6 +1411,40 @@ def _emit_struct_impl(
             )
         else:
             lines.append(f"    {field} = {source};")
+    if callback_groups:
+        # Reading a native struct back wraps each raw callback + userdata into a
+        # forwarder callable so a later to_cstruct can pass them through again.
+        native_callbacks = " || ".join(
+            f"native.{member.name}"
+            for _, members in callback_groups
+            for member in members
+        )
+        lines.append("    callbacks_.reset();")
+        lines.append(f"    if ({native_callbacks}) {{")
+        lines.append("        callbacks_ = std::make_shared<Callbacks>();")
+        for carrier, members in callback_groups:
+            for member in members:
+                func_pointer = ir.func_pointers[member.type]
+                field = _callback_field_name(member)
+                ret = func_pointer.c_return_type or "void"
+                params = ", ".join(
+                    f"{_native_type(p)} {p.name}"
+                    for p in func_pointer.params
+                    if p.name != carrier
+                )
+                forwarder_args = ", ".join(
+                    "native_userdata" if p.name == carrier else p.name
+                    for p in func_pointer.params
+                )
+                body = (
+                    f"{{ native_pfn({forwarder_args}); }}"
+                    if ret == "void"
+                    else f"{{ return native_pfn({forwarder_args}); }}"
+                )
+                lines.append(
+                    f"        if (native.{member.name}) callbacks_->{field} = [native_pfn = native.{member.name}, native_userdata = native.{carrier}]({params}) -> {ret} {body};"
+                )
+        lines.append("    }")
     lines.extend(["}"])
     output_lines = [
         f"inline void {name}::from_output_cstruct(const native_type& native) {{"
@@ -1277,6 +1455,8 @@ def _emit_struct_impl(
         for member in struct.members:
             category = _type_category(member.type, ir)
             if member.name == "pNext" or category == "handle":
+                continue
+            if member.name in carrier_members or member.name in callback_members:
                 continue
             source = f"native.{member.name}"
             field = field_names.get(member.name, member.name)

@@ -202,6 +202,53 @@ def test_count_members_are_explicit_and_array_setters_write_them(tmp_path):
     assert "output->value.viewportCount = viewportCount;" in viewport_impl
 
 
+def test_callback_members_become_refcounted_callables(tmp_path):
+    supplemental = tmp_path / "callbacks.xml"
+    supplemental.write_text(
+        """<registry><types>
+      <type category="funcpointer">
+        <proto><type>VkBool32</type> <name>PFN_vkTestCallback</name></proto>
+        <param><type>VkBool32</type> <name>flag</name></param>
+        <param><type>void</type>* <name>pUserData</name></param>
+      </type>
+      <type category="struct" name="VkCallbackStruct">
+        <member><type>uint32_t</type> <name>valueCount</name></member>
+        <member><type>PFN_vkTestCallback</type> <name>pfnCallback</name></member>
+        <member optional="true"><type>void</type>* <name>pUserData</name></member>
+      </type>
+    </types></registry>""",
+        encoding="utf-8",
+    )
+    output = tmp_path / "wrapper.hpp"
+    assert (
+        run(
+            [
+                "--registry",
+                str(FIXTURE),
+                "--registry",
+                str(supplemental),
+                "--emit", str(ROOT / "templates" / "vulkan-header-only.template.hpp") + ":" + str(output),
+            ]
+        )
+        == 0
+    )
+    generated = output.read_text(encoding="utf-8")
+    struct_body = generated[generated.index("struct CallbackStruct {") :]
+    struct_body = struct_body[: struct_body.index("\n};")]
+    assert "struct Callbacks {" in struct_body
+    assert "std::function<VkBool32(VkBool32)> callback{};" in struct_body
+    assert "std::shared_ptr<Callbacks> callbacks_{};" in struct_body
+    assert "setCallback(std::function<VkBool32(VkBool32)> value)" in struct_body
+    assert "pfnCallback{}" not in struct_body
+    assert "pUserData{}" not in struct_body
+    trampoline = generated[generated.index("CallbackStruct_callback_trampoline") :]
+    assert "static_cast<CallbackStruct::Callbacks*>(pUserData)" in trampoline
+    to_cstruct = generated[generated.index("inline void CallbackStruct::to_cstruct") :]
+    to_cstruct = to_cstruct[: to_cstruct.index("\n}")]
+    assert "output->value.pfnCallback = CallbackStruct_callback_trampoline;" in to_cstruct
+    assert "output->value.pUserData = callbacks_ ? callbacks_.get() : nullptr;" in to_cstruct
+
+
 def test_shared_command_counts_never_exceed_span_storage(tmp_path):
     supplemental = tmp_path / "commands.xml"
     supplemental.write_text(

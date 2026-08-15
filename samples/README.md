@@ -75,3 +75,10 @@ cmake --build samples/build
   `VkPhysicalDeviceVulkan13Features` node, the wrapper sets its `privateData`
   member directly instead of also injecting the older
   `VkPhysicalDevicePrivateDataFeatures` extension struct.
+- Callback function-pointer fields (`AllocationCallbacks`,
+  `DebugUtilsMessengerCreateInfoEXT`, `DebugReportCallbackCreateInfoEXT`,
+  `DeviceDeviceMemoryReportCreateInfoEXT`) are refcounted callables: use
+  `setXxx(std::function<...>)` with a capturing lambda, and the wrapper keeps
+  the capture alive for as long as the struct does (the paired `pUserData` is
+  managed by the wrapper). `common/validation.hpp` uses this to install the
+  validation messenger.
