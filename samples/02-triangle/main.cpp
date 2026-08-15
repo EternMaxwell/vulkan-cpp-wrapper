@@ -9,6 +9,7 @@
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
 #include <vulkan_wrapper.hpp>
+#include <validation.hpp>
 
 #include <array>
 #include <cstdint>
@@ -178,8 +179,18 @@ int main() {
     instanceInfo.setApplicationInfo(app);
     instanceInfo.setEnabledExtensionNames(
         {VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_WIN32_SURFACE_EXTENSION_NAME});
+    sample::ValidationReporter validation{};
+    vk::DebugUtilsMessengerCreateInfoEXT messengerInfo{};
+    const bool validationEnabled =
+        sample::enableValidationIfAvailable(*context, instanceInfo, messengerInfo, validation);
     auto instance = context->createInstance(instanceInfo, std::nullopt);
     if (!instance) { std::println(stderr, "createInstance failed"); return 1; }
+    vk::DebugUtilsMessengerEXT messenger{};
+    if (validationEnabled) {
+        auto created = instance->createDebugUtilsMessengerEXT(messengerInfo, std::nullopt);
+        if (!created) std::println(stderr, "warning: createDebugUtilsMessengerEXT failed");
+        else messenger = std::move(*created);
+    }
 
     VkSurfaceKHR rawSurface{};
     if (glfwCreateWindowSurface(instance->raw(), window, nullptr, &rawSurface) != VK_SUCCESS) {
@@ -218,6 +229,7 @@ int main() {
            .setImageExtent(vk::Extent2D{kWidth, kHeight})
            .setImageArrayLayers(1)
            .setImageUsage(vk::ImageUsageFlagBits::ColorAttachment)
+           .setCompositeAlpha(vk::CompositeAlphaFlagBitsKHR::Opaque)
            .setPreTransform(vk::SurfaceTransformFlagBitsKHR::Identity)
            .setPresentMode(vk::PresentModeKHR::Fifo);
     auto swapchain = device->createSwapchainKHR(swapInfo, std::nullopt);
@@ -315,12 +327,19 @@ int main() {
             .setCommandBufferCount(static_cast<std::uint32_t>(framebuffers.size())));
     if (!commandBuffers) { std::println(stderr, "allocateCommandBuffers failed"); return 1; }
 
-    // Synchronization.
+    // Synchronization. renderFinished is per-swapchain-image: a present waits
+    // on it asynchronously, so reusing a single semaphore for every frame would
+    // re-signal it while the previous present is still consuming it.
     auto imageAvailable = device->createSemaphore(vk::SemaphoreCreateInfo{}, std::nullopt);
-    auto renderFinished = device->createSemaphore(vk::SemaphoreCreateInfo{}, std::nullopt);
+    std::vector<vk::Semaphore> renderFinished;
+    for (std::size_t i = 0; i < swapImages.value.size(); ++i) {
+        auto rf = device->createSemaphore(vk::SemaphoreCreateInfo{}, std::nullopt);
+        if (!rf) { std::println(stderr, "sync object creation failed"); return 1; }
+        renderFinished.push_back(std::move(*rf));
+    }
     auto inFlight = device->createFence(
         vk::FenceCreateInfo{}.setFlags(vk::FenceCreateFlagBits::Signaled), std::nullopt);
-    if (!imageAvailable || !renderFinished || !inFlight) {
+    if (!imageAvailable || !inFlight) {
         std::println(stderr, "sync object creation failed"); return 1;
     }
 
@@ -358,13 +377,13 @@ int main() {
         submit.setWaitSemaphores({*imageAvailable})
               .setWaitDstStageMask({vk::PipelineStageFlagBits::ColorAttachmentOutput})
               .setCommandBuffers({cmd})
-              .setSignalSemaphores({*renderFinished});
+              .setSignalSemaphores({renderFinished[imageIndex]});
         if (!queue.submit(std::array{submit}, *inFlight)) {
             std::println(stderr, "queueSubmit failed"); return 1;
         }
 
         vk::PresentInfoKHR present{};
-        present.setWaitSemaphores({*renderFinished})
+        present.setWaitSemaphores({renderFinished[imageIndex]})
                .setSwapchains({*swapchain})
                .setImageIndices({imageIndex});
         auto presentResult = queue.presentKHR(present);
@@ -497,5 +516,6 @@ int main() {
         return 1;
     }
     std::println("PASS: triangle rendered and verified");
+    if (!sample::reportValidation(validation)) return 1;
     return 0;
 }

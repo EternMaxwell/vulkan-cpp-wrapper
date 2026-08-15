@@ -6,6 +6,7 @@
 // depth test (LESS) must keep the blue triangle on top in the overlap region.
 #include <volk.h>
 #include <vulkan_wrapper.hpp>
+#include <validation.hpp>
 
 #include <array>
 #include <cstdint>
@@ -58,8 +59,18 @@ int main() {
     app.setApiVersion(VK_API_VERSION_1_3);
     vk::InstanceCreateInfo instanceInfo{};
     instanceInfo.setApplicationInfo(app);
+    sample::ValidationReporter validation{};
+    vk::DebugUtilsMessengerCreateInfoEXT messengerInfo{};
+    const bool validationEnabled =
+        sample::enableValidationIfAvailable(*context, instanceInfo, messengerInfo, validation);
     auto instance = context->createInstance(instanceInfo, std::nullopt);
     if (!instance) { std::println(stderr, "createInstance failed"); return 1; }
+    vk::DebugUtilsMessengerEXT messenger{};
+    if (validationEnabled) {
+        auto created = instance->createDebugUtilsMessengerEXT(messengerInfo, std::nullopt);
+        if (!created) std::println(stderr, "warning: createDebugUtilsMessengerEXT failed");
+        else messenger = std::move(*created);
+    }
 
     auto devices = instance->enumeratePhysicalDevices();
     if (devices.value.empty()) { std::println(stderr, "no physical devices"); return 1; }
@@ -238,7 +249,8 @@ int main() {
     auto pipeline = std::move(pipelines.value[0]);
 
     auto commandPool = device->createCommandPool(
-        vk::CommandPoolCreateInfo{}.setQueueFamilyIndex(queueFamily), std::nullopt);
+        vk::CommandPoolCreateInfo{}.setQueueFamilyIndex(queueFamily)
+            .setFlags(vk::CommandPoolCreateFlagBits::ResetCommandBuffer), std::nullopt);
     auto commandBuffers = device->allocateCommandBuffers(
         vk::CommandBufferAllocateInfo{}.setCommandPool(*commandPool)
             .setLevel(vk::CommandBufferLevel::Primary).setCommandBufferCount(1));
@@ -318,5 +330,6 @@ int main() {
                  std::array<int, 4>{corner[0], corner[1], corner[2], corner[3]}, cornerRed ? "red" : "wrong");
     if (!centerBlue || !cornerRed) { std::println(stderr, "FAIL: depth verification failed"); return 1; }
     std::println("PASS: depth test verified");
+    if (!sample::reportValidation(validation)) return 1;
     return 0;
 }

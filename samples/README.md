@@ -51,6 +51,12 @@ cmake --build samples/build
 
 ## Notes / known limitations
 
+- Every sample enables `VK_LAYER_KHRONOS_validation` when the loader exposes it
+  (see `common/validation.hpp`) and registers a debug-utils messenger, then
+  fails if any ERROR-level validation message was emitted. This turned the
+  samples into an API-misuse checker: it caught a zero `compositeAlpha` on the
+  swapchain, a reused presentation semaphore in `02-triangle`, and command
+  buffers reset from pools lacking `VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT`.
 - Samples enable the extensions whose commands they call
   (`VK_KHR_surface` + `VK_KHR_win32_surface` on the instance,
   `VK_KHR_swapchain` on the device). Command dispatch is null-guarded: calling
@@ -64,3 +70,8 @@ cmake --build samples/build
 - These samples surfaced and drove fixes for several generator bugs, including
   the `descriptorCount` field of `VkDescriptorSetLayoutBinding` being wrongly
   derived from `pImmutableSamplers.size()` (it is now an explicit field).
+- Device creation enables the wrapper's private-data handle tracking without
+  tripping `VUID-VkDeviceCreateInfo-pNext-06532`: when the user chains a
+  `VkPhysicalDeviceVulkan13Features` node, the wrapper sets its `privateData`
+  member directly instead of also injecting the older
+  `VkPhysicalDevicePrivateDataFeatures` extension struct.

@@ -100,7 +100,8 @@ function(wrapper_sample target)
     target_link_libraries(${target} PRIVATE volk::volk_headers volk::volk)
     target_include_directories(${target} PRIVATE
         ${CMAKE_BINARY_DIR}/generated
-        ${vulkan_headers_SOURCE_DIR}/include)
+        ${vulkan_headers_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_LIST_DIR}/common)
     if (WIN32)
         target_compile_definitions(${target} PRIVATE VK_USE_PLATFORM_WIN32_KHR NOMINMAX)
     endif()

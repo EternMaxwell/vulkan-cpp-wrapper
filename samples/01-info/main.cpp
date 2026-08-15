@@ -3,6 +3,7 @@
 // RAII handle + counted-query convenience APIs.
 #include <volk.h>
 #include <vulkan_wrapper.hpp>
+#include <validation.hpp>
 
 #include <cstdio>
 #include <cstring>
@@ -30,11 +31,26 @@ int main() {
     vk::InstanceCreateInfo instanceInfo{};
     instanceInfo.setApplicationInfo(app);
 
+    sample::ValidationReporter validation{};
+    vk::DebugUtilsMessengerCreateInfoEXT messengerInfo{};
+    const bool validationEnabled =
+        sample::enableValidationIfAvailable(*context, instanceInfo, messengerInfo, validation);
+
     auto instance = context->createInstance(instanceInfo, std::nullopt);
     if (!instance) {
         std::fprintf(stderr, "error: failed to create instance: %d\n",
                      static_cast<int>(instance.error()));
         return 1;
+    }
+    vk::DebugUtilsMessengerEXT messenger{};
+    if (validationEnabled) {
+        auto created = instance->createDebugUtilsMessengerEXT(messengerInfo, std::nullopt);
+        if (!created) {
+            std::fprintf(stderr, "warning: createDebugUtilsMessengerEXT failed: %d\n",
+                         static_cast<int>(created.error()));
+        } else {
+            messenger = std::move(*created);
+        }
     }
 
     auto devices = instance->enumeratePhysicalDevices();
@@ -65,5 +81,6 @@ int main() {
     }
 
     std::printf("done\n");
+    if (!sample::reportValidation(validation)) return 1;
     return 0;
 }

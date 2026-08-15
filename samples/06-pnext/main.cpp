@@ -6,6 +6,7 @@
 // is the wrapper's replacement for hand-building VkBaseOutStructure lists.
 #include <volk.h>
 #include <vulkan_wrapper.hpp>
+#include <validation.hpp>
 
 #include <print>
 
@@ -26,8 +27,18 @@ int main() {
     app.setApiVersion(VK_API_VERSION_1_3);
     vk::InstanceCreateInfo instanceInfo{};
     instanceInfo.setApplicationInfo(app);
+    sample::ValidationReporter validation{};
+    vk::DebugUtilsMessengerCreateInfoEXT messengerInfo{};
+    const bool validationEnabled =
+        sample::enableValidationIfAvailable(*context, instanceInfo, messengerInfo, validation);
     auto instance = context->createInstance(instanceInfo, std::nullopt);
     if (!instance) { std::println(stderr, "createInstance failed"); return 1; }
+    vk::DebugUtilsMessengerEXT messenger{};
+    if (validationEnabled) {
+        auto created = instance->createDebugUtilsMessengerEXT(messengerInfo, std::nullopt);
+        if (!created) std::println(stderr, "warning: createDebugUtilsMessengerEXT failed");
+        else messenger = std::move(*created);
+    }
 
     auto devices = instance->enumeratePhysicalDevices();
     if (devices.value.empty()) { std::println(stderr, "no physical devices"); return 1; }
@@ -66,7 +77,9 @@ int main() {
     bool recursive = got12b != nullptr &&
                      got12b->nextInChain.get<vk::PhysicalDeviceVulkan13Features>() != nullptr;
 
-    // 5. Enable a feature at device creation through a chained struct.
+    // 5. Enable a feature at device creation through a chained struct. The
+    // wrapper recognizes the promoted 1.3 struct and enables privateData on it
+    // directly instead of injecting a conflicting VkPhysicalDevicePrivateDataFeatures node.
     vk::PhysicalDeviceVulkan13Features enable13{};
     enable13.setDynamicRendering(true);
     std::uint32_t family = find_graphics_family(physical);
@@ -85,5 +98,6 @@ int main() {
         return 1;
     }
     std::println("PASS: pNext chain verified");
+    if (!sample::reportValidation(validation)) return 1;
     return 0;
 }
