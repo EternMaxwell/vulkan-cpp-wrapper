@@ -83,7 +83,9 @@ def test_supplemental_structs_deep_own_nested_pointers(tmp_path):
     assert "std::optional<StdVideoSps> sps{};" in generated
 
 
-def test_shared_counts_never_exceed_owned_array_storage(tmp_path):
+def test_array_setters_write_shared_count_field(tmp_path):
+    # Vulkan-Hpp keeps every count field explicit; the array setter additionally
+    # writes the matching count so the two stay consistent.
     supplemental = tmp_path / "arrays.xml"
     supplemental.write_text(
         """<registry><types>
@@ -114,23 +116,39 @@ def test_shared_counts_never_exceed_owned_array_storage(tmp_path):
         == 0
     )
     generated = output.read_text(encoding="utf-8")
-    parallel = generated[generated.index("inline void ParallelArrays::to_cstruct") :]
-    parallel = parallel[: parallel.index("\n}")]
-    assert "std::size_t capacity = left.size();" in parallel
-    assert "if (candidate < capacity) capacity = candidate;" in parallel
-    alternative = generated[
-        generated.index("inline void AlternativeArrays::to_cstruct") :
-    ]
-    alternative = alternative[: alternative.index("\n}")]
-    assert "std::size_t capacity{};" in alternative
-    assert "candidate != 0 && (capacity == 0 || candidate < capacity)" in alternative
+    parallel = generated[generated.index("struct ParallelArrays {") :]
+    parallel = parallel[: parallel.index("\n};")]
+    assert "uint32_t valueCount{};" in parallel
+    assert "setValueCount(uint32_t value)" in parallel
+    assert (
+        "setLeft(std::vector<uint32_t> value) & { left = std::move(value); valueCount = static_cast<uint32_t>(left.size()); return *this; }"
+        in parallel
+    )
+    assert (
+        "setRight(std::vector<uint32_t> value) & { right = std::move(value); valueCount = static_cast<uint32_t>(right.size()); return *this; }"
+        in parallel
+    )
+    alternative = generated[generated.index("struct AlternativeArrays {") :]
+    alternative = alternative[: alternative.index("\n};")]
+    assert "uint32_t valueCount{};" in alternative
+    assert "setValueCount(uint32_t value)" in alternative
+    assert (
+        "setDirect(std::vector<uint32_t> value) & { direct = std::move(value); valueCount = static_cast<uint32_t>(direct.size()); return *this; }"
+        in alternative
+    )
+    assert (
+        "setIndirect(std::vector<uint32_t> value) & { indirect = std::move(value); valueCount = static_cast<uint32_t>(indirect.size()); return *this; }"
+        in alternative
+    )
+    parallel_impl = generated[generated.index("inline void ParallelArrays::to_cstruct") :]
+    parallel_impl = parallel_impl[: parallel_impl.index("\n}")]
+    assert "output->value.valueCount = valueCount;" in parallel_impl
+    assert "std::size_t capacity" not in parallel_impl
 
 
-def test_non_derived_count_member_stays_explicit(tmp_path):
-    # descriptorCount is the number of descriptors in a binding, not the length
-    # of pImmutableSamplers (which is only conditionally that long), so it must
-    # stay an explicit field; viewportCount, in contrast, is a plain array
-    # length and stays derived.
+def test_count_members_are_explicit_and_array_setters_write_them(tmp_path):
+    # descriptorCount and viewportCount are both plain length fields: they stay
+    # explicit real fields, and setImmutableSamplers/setViewports also write them.
     supplemental = tmp_path / "counts.xml"
     supplemental.write_text(
         """<registry><types>
@@ -163,16 +181,25 @@ def test_non_derived_count_member_stays_explicit(tmp_path):
     binding = generated[generated.index("struct BindingLike {") :]
     binding = binding[: binding.index("\n};")]
     assert "uint32_t descriptorCount{};" in binding
-    assert "setDescriptorCount" in binding
+    assert "setDescriptorCount(uint32_t value)" in binding
+    assert (
+        "setImmutableSamplers(std::vector<Buffer> value) & { immutableSamplers = std::move(value); descriptorCount = static_cast<uint32_t>(immutableSamplers.size()); return *this; }"
+        in binding
+    )
     binding_impl = generated[generated.index("BindingLike::to_cstruct") :]
     binding_impl = binding_impl[: binding_impl.index("\n}")]
-    assert "descriptorCount = descriptorCount;" in binding_impl
+    assert "output->value.descriptorCount = descriptorCount;" in binding_impl
     viewport = generated[generated.index("struct ViewportLike {") :]
     viewport = viewport[: viewport.index("\n};")]
-    assert "viewportCount" not in viewport
+    assert "uint32_t viewportCount{};" in viewport
+    assert "setViewportCount(uint32_t value)" in viewport
+    assert (
+        "setViewports(std::vector<Buffer> value) & { viewports = std::move(value); viewportCount = static_cast<uint32_t>(viewports.size()); return *this; }"
+        in viewport
+    )
     viewport_impl = generated[generated.index("ViewportLike::to_cstruct") :]
     viewport_impl = viewport_impl[: viewport_impl.index("\n}")]
-    assert "viewportCount = static_cast<uint32_t>(viewports.size());" in viewport_impl
+    assert "output->value.viewportCount = viewportCount;" in viewport_impl
 
 
 def test_shared_command_counts_never_exceed_span_storage(tmp_path):
@@ -349,10 +376,11 @@ def test_registry_constants_receive_safe_cpp_names(tmp_path):
     assert "template <typename T> [[nodiscard]] const T* get() const noexcept" in generated
     shader = generated[generated.index("struct ShaderModuleCreateInfo {") :]
     shader = shader[: shader.index("\n};")]
-    assert "size_t codeSize" not in shader
+    assert "size_t codeSize{};" in shader
     assert "std::vector<uint32_t> code{};" in shader
-    assert "setCodeSize" not in shader
-    assert "output->value.codeSize = static_cast<size_t>(code.size() * 4);" in generated
+    assert "setCodeSize(size_t value)" in shader
+    assert "setCode(std::vector<uint32_t> value)" in shader
+    assert "codeSize = static_cast<size_t>(code.size() * 4);" in shader
     assert (
         "code.assign(native.pCode, native.pCode + static_cast<std::size_t>(native.codeSize / 4));"
         in generated
@@ -502,10 +530,13 @@ def test_header_only_generation_is_deterministic(tmp_path):
     profile_list = first[first.index("struct VideoProfileListInfoKHR {") :]
     profile_list = profile_list[: profile_list.index("\n};")]
     assert "std::vector<VideoProfileInfoKHR> profiles{};" in profile_list
-    assert "setProfiles(std::vector<VideoProfileInfoKHR> value)" in profile_list
-    assert "uint32_t profileCount{};" not in profile_list
+    assert "uint32_t profileCount{};" in profile_list
+    assert "setProfileCount(uint32_t value)" in profile_list
+    assert (
+        "setProfiles(std::vector<VideoProfileInfoKHR> value) & { profiles = std::move(value); profileCount = static_cast<uint32_t>(profiles.size()); return *this; }"
+        in profile_list
+    )
     assert "pProfiles{};" not in profile_list
-    assert "setProfileCount" not in profile_list
     assert "setPProfiles" not in profile_list
     conversion = first[
         first.index("inline void VideoProfileListInfoKHR::from_cstruct") :

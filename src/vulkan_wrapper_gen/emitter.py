@@ -528,20 +528,11 @@ def _safe_default(param: Param, cpp_type: str) -> str:
 # Struct helpers
 # ---------------------------------------------------------------------------
 
-# Members whose `len` count must stay an explicit, settable field instead of
-# being derived from the array's size. pImmutableSamplers is only conditionally
-# descriptorCount-sized (and only for sampler descriptor types), so deriving
-# descriptorCount from immutableSamplers.size() would be wrong.
-_NON_DERIVED_COUNT_MEMBERS = {"pImmutableSamplers"}
-
-
 def _count_sources(struct: Struct) -> dict[str, Param]:
     result: dict[str, Param] = {}
     member_names = {member.name for member in struct.members}
     for member in struct.members:
         if "[" in member.c_suffix:
-            continue
-        if member.name in _NON_DERIVED_COUNT_MEMBERS:
             continue
         for length in _lengths(member):
             if re.fullmatch(r"[A-Za-z_]\w*", length):
@@ -551,6 +542,28 @@ def _count_sources(struct: Struct) -> dict[str, Param]:
         if quotient and quotient.group(1) in member_names:
             result.setdefault(quotient.group(1), member)
     return result
+
+
+def _array_count_field(struct: Struct, member: Param) -> tuple[Param, int] | None:
+    """The scalar count field an array member is sized by, plus the element
+    multiplier for that length, so the array setter can also write the count.
+
+    A byte-length count such as ``codeSize / 4`` multiplies the element count
+    back out to recover the byte size."""
+    names = {m.name: m for m in struct.members}
+    expression = (member.alt_length or "").strip()
+    quotient = re.fullmatch(r"([A-Za-z_]\w*)\s*/\s*([1-9]\d*)", expression)
+    if quotient:
+        count = names.get(quotient.group(1))
+        if count is not None and count.pointer_depth == 0 and not count.c_suffix:
+            return count, int(quotient.group(2))
+        return None
+    for length in _lengths(member):
+        if re.fullmatch(r"[A-Za-z_]\w*", length):
+            count = names.get(length)
+            if count is not None and count.pointer_depth == 0 and not count.c_suffix:
+                return count, 1
+    return None
 
 
 def _context_length_name(key: str) -> str:
@@ -621,81 +634,6 @@ def _native_array_size(param: Param, struct: Struct) -> str | None:
             f"native.{match.group(0)}" if match.group(0) in names else match.group(0)
         ),
         expression,
-    )
-
-
-def _native_count_value(count: Param, source: Param, source_field: str) -> str:
-    expression = (source.alt_length or "").strip()
-    quotient = re.fullmatch(rf"{re.escape(count.name)}\s*/\s*([1-9]\d*)", expression)
-    if quotient:
-        return f"{source_field}.size() * {quotient.group(1)}"
-    return f"{source_field}.size()"
-
-
-def _array_members(struct: Struct) -> dict[str, list[Param]]:
-    result: dict[str, list[Param]] = {}
-    for member in struct.members:
-        if "[" in member.c_suffix:
-            continue
-        for length in _lengths(member):
-            if (
-                length
-                and length != "null-terminated"
-                and re.fullmatch(r"[A-Za-z_]\w*", length)
-            ):
-                result.setdefault(length, []).append(member)
-    return result
-
-
-def _safe_native_count_value(
-    count: Param, struct: Struct, field_names: dict[str, str]
-) -> str:
-    sources = _array_members(struct).get(count.name, ())
-    if not sources:
-        expression_source = _count_sources(struct).get(count.name)
-        sources = (expression_source,) if expression_source else ()
-    if not sources:
-        return "0"
-    entries = [
-        (source, _native_count_value(count, source, field_names[source.name]))
-        for source in sources
-        if source.name in field_names
-    ]
-    if not entries:
-        return "0"
-    if len(entries) == 1:
-        return entries[0][1]
-    required = [
-        value
-        for source, value in entries
-        if not source.is_optional and not source.no_auto_validity
-    ]
-    conditional = [
-        value
-        for source, value in entries
-        if source.is_optional or source.no_auto_validity
-    ]
-    if required:
-        initial, *remaining = required
-        required_loop = (
-            f" for (std::size_t candidate : std::initializer_list<std::size_t>{{{', '.join(remaining)}}}) "
-            "if (candidate < capacity) capacity = candidate;"
-            if remaining
-            else ""
-        )
-        conditional_loop = (
-            f" for (std::size_t candidate : std::initializer_list<std::size_t>{{{', '.join(conditional)}}}) "
-            "if (candidate != 0 && candidate < capacity) capacity = candidate;"
-            if conditional
-            else ""
-        )
-        return f"[&] {{ std::size_t capacity = {initial};{required_loop}{conditional_loop} return capacity; }}()"
-    capacities = ", ".join(conditional)
-    return (
-        f"[&] {{ std::size_t capacity{{}}; for (std::size_t candidate : "
-        f"std::initializer_list<std::size_t>{{{capacities}}}) "
-        "if (candidate != 0 && (capacity == 0 || candidate < capacity)) capacity = candidate; "
-        "return capacity; }()"
     )
 
 
@@ -785,12 +723,9 @@ def _borrow_handle_lines(
 
 
 def _struct_member_names(struct: Struct) -> dict[str, str]:
-    omitted = set(_count_sources(struct))
     result: dict[str, str] = {}
     used: set[str] = set()
     for member in struct.members:
-        if member.name in omitted:
-            continue
         name = member.name
         if member.pointer_depth and re.match(r"p+[A-Z]", name):
             base = re.sub(r"^p+(?=[A-Z])", "", name)
@@ -915,11 +850,23 @@ def _emit_struct(
         field_name = field_names[member.name]
         method = field_name[:1].upper() + field_name[1:]
         cpp = _member_cpp(member, ir, config)
+        count = _array_count_field(struct, member)
+        count_stmt = ""
+        if count is not None:
+            count_param, multiplier = count
+            count_field = field_names[count_param.name]
+            count_type = _member_cpp(count_param, ir, config)
+            size_expr = f"{field_name}.size()"
+            if multiplier != 1:
+                size_expr += f" * {multiplier}"
+            count_stmt = (
+                f" {count_field} = static_cast<{count_type}>({size_expr});"
+            )
         lines.append(
-            f"    {name}& set{method}({cpp} value) & {{ {field_name} = std::move(value); return *this; }}"
+            f"    {name}& set{method}({cpp} value) & {{ {field_name} = std::move(value);{count_stmt} return *this; }}"
         )
         lines.append(
-            f"    {name}&& set{method}({cpp} value) && {{ {field_name} = std::move(value); return std::move(*this); }}"
+            f"    {name}&& set{method}({cpp} value) && {{ {field_name} = std::move(value);{count_stmt} return std::move(*this); }}"
         )
     if "pNext" in {member.name for member in struct.members}:
         # No compile-time "extends" constraint here: Vulkan validates the pNext
@@ -1037,7 +984,6 @@ def _emit_struct_impl(
     if not struct.members:
         return ""
     name = _cpp_type(struct.name, ir, config)
-    counts = _count_sources(struct)
     field_names = _struct_member_names(struct)
     lines = [
         f"inline void {name}::to_cstruct(CStruct* output) const {{",
@@ -1053,9 +999,6 @@ def _emit_struct_impl(
             lines.append(
                 f"    {target} = reinterpret_cast<decltype({target})>(const_cast<void*>(nextInChain.native()));"
             )
-        elif member.name in counts:
-            count_value = _safe_native_count_value(member, struct, field_names)
-            lines.append(f"    {target} = static_cast<{member.c_type}>({count_value});")
         elif array_sizes:
             if category == "struct":
                 lines.append(
@@ -1183,7 +1126,7 @@ def _emit_struct_impl(
         source = f"native.{member.name}"
         field = field_names.get(member.name, member.name)
         array_sizes = re.findall(r"\[([^\]]+)\]", member.c_suffix)
-        if member.name == "pNext" or member.name in counts:
+        if member.name == "pNext":
             continue
         if array_sizes:
             if category == "struct":
@@ -1333,7 +1276,7 @@ def _emit_struct_impl(
     else:
         for member in struct.members:
             category = _type_category(member.type, ir)
-            if member.name == "pNext" or member.name in counts or category == "handle":
+            if member.name == "pNext" or category == "handle":
                 continue
             source = f"native.{member.name}"
             field = field_names.get(member.name, member.name)
