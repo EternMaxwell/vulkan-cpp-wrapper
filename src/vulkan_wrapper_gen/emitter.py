@@ -1,25 +1,34 @@
+"""C++23 wrapper emitter driven directly by the middle-layer IR.
+
+The emitter consumes :class:`vulkan_wrapper_gen.ir.IrRegistry` and nothing
+else from the XML pipeline.  The IR already carries the derived facts the
+previous analysis layer re-derived from the raw registry (receivers, member
+names, output shapes, creation records, releasers, array/count links), so the
+emitter reads them directly rather than reconstructing them.
+"""
+
 from __future__ import annotations
 
-from dataclasses import dataclass
 import re
 
-from .analysis import (
-    ApiAnalysis,
-    CommandAnalysis,
-    HandleAnalysis,
-    analyze,
-    creation_info_for_handle,
-    creation_infos_for_handle,
-    handle_releasers,
-    is_owned_handle_output,
-    release_target,
-)
 from .config import GeneratorConfig
-from .model import Command, EnumGroup, Member, Registry, TypeDecl
-from .naming import constant_name, enum_name, flag_mask_name, strip_vk
+from .ir.model import (
+    Command,
+    Enum,
+    EnumValue,
+    Handle,
+    IrRegistry,
+    Param,
+    Struct,
+)
+from .naming import constant_name, enum_name
 from .template import Template
 from .vma import VmaModel
 
+
+# ---------------------------------------------------------------------------
+# Name/type helpers
+# ---------------------------------------------------------------------------
 
 def _guard(text: str, protect: str | None) -> str:
     return (
@@ -29,193 +38,191 @@ def _guard(text: str, protect: str | None) -> str:
     )
 
 
-def _native_type(member: Member) -> str:
-    prefix = "const " if member.const else ""
-    # Array parameters in C declarations decay to pointers even though the XML
-    # spelling has no `*` token (for example `float values[4]`).
-    depth = member.pointer_depth + (1 if "[" in member.declaration else 0)
-    return prefix + member.type + "*" * depth
-
-
-def _public_param_name(member: Member) -> str:
-    if member.pointer_depth and re.match(r"p+[A-Z]", member.name):
-        base = re.sub(r"^p+(?=[A-Z])", "", member.name)
-        return base[:1].lower() + base[1:]
-    return member.name
-
-
-def _method_name(item: CommandAnalysis, receiver: str, config: GeneratorConfig) -> str:
-    """Return a receiver-relative method name.
-
-    Vulkan command names commonly repeat the object they operate on, e.g.
-    vkQueueSubmit and vkGetFenceStatus.  Once the corresponding parameter is
-    bound to `this`, retaining that qualifier adds no information.  Explicit
-    naming configuration always wins over this automatic reduction.
-    """
-    override = config.receivers.get(item.command.name)
-    if (override and override.rename) or item.command.name in config.command_names:
-        return item.cpp_name
-    if (
-        receiver == "VkCommandBuffer"
-        and item.cpp_name.startswith("cmd")
-        and len(item.cpp_name) > 3
+def _c_name(ir: IrRegistry, general: str) -> str | None:
+    """General name -> exact C spelling by consulting every IR collection."""
+    for collection in (
+        ir.handles,
+        ir.structs,
+        ir.enums,
+        ir.bitmasks,
+        ir.basetypes,
+        ir.func_pointers,
+        ir.aliases,
+        ir.defines,
+        ir.raw_types,
     ):
-        return item.cpp_name[3].lower() + item.cpp_name[4:]
-    receiver_name = config.type_names.get(receiver, strip_vk(receiver))
-    pascal = item.cpp_name[:1].upper() + item.cpp_name[1:]
-    index = pascal.find(receiver_name)
-    if index < 0:
-        return item.cpp_name
-    shortened = pascal[:index] + pascal[index + len(receiver_name) :]
-    if not shortened:
-        return item.cpp_name
-    return shortened[:1].lower() + shortened[1:]
+        item = collection.get(general)
+        if item is not None:
+            return item.c_name
+    return None
 
 
-def _callable_name(
-    item: CommandAnalysis, receiver: str | None, config: GeneratorConfig
-) -> str:
-    return (
-        _method_name(item, receiver, config) if receiver is not None else item.cpp_name
-    )
-
-
-def _command_result_name(item: CommandAnalysis) -> str:
-    return item.cpp_name[:1].upper() + item.cpp_name[1:] + "Result"
-
-
-def _public_param_type(
-    member: Member, registry: Registry, config: GeneratorConfig
-) -> str:
-    cpp = _cpp_type(member.type, registry, config)
-    array_sizes = re.findall(r"\[([^\]]+)\]", member.declaration)
-    if array_sizes:
-        extent = ", ".join(array_sizes)
-        return f"std::span<{'const ' if member.const else ''}{cpp}, {extent}>"
-    if member.pointer_depth == 0 and "[" not in member.declaration:
-        if (
-            member.type in registry.types
-            and registry.types[member.type].category == "handle"
-        ):
-            if "true" in member.optional:
-                return f"const std::optional<{cpp}>&"
-            return f"const {cpp}&"
-        return cpp
-    if (
-        member.const
-        and member.type == "char"
-        and member.pointer_depth == 1
-        and "null-terminated" in member.length
-    ):
-        return (
-            "std::optional<std::string_view>"
-            if "true" in member.optional
-            else "std::string_view"
-        )
-    if member.length and "null-terminated" not in member.length:
-        if member.type == "void":
-            return (
-                "std::span<const std::byte>" if member.const else "std::span<std::byte>"
-            )
-        return f"std::span<{'const ' if member.const else ''}{cpp}>"
-    is_output = not member.const
-    if is_output:
-        if member.type == "void":
-            return "void" + "*" * member.pointer_depth
-        return f"{cpp}*"
-    if (
-        member.pointer_depth == 1
-        and member.type in registry.types
-        and registry.types[member.type].category in {"struct", "union"}
-    ):
-        if "true" in member.optional:
-            return f"std::optional<std::reference_wrapper<const {cpp}>>"
-        return f"const {cpp}&"
-    if member.type in registry.types:
-        prefix = "const " if member.const else ""
-        return prefix + cpp + "*" * member.pointer_depth
-    return _native_type(member)
-
-
-def _public_argument(
-    member: Member, registry: Registry, name: str | None = None
-) -> str:
-    name = name or _public_param_name(member)
-    if (
-        member.length and "null-terminated" not in member.length
-    ) or "[" in member.declaration:
-        if member.type == "void":
-            return f"reinterpret_cast<{'const ' if member.const else ''}void*>({name}.empty() ? nullptr : {name}.data())"
-        return f"{name}.empty() ? nullptr : {name}.data()"
-    if (
-        member.const
-        and member.pointer_depth == 1
-        and member.type in registry.types
-        and registry.types[member.type].category in {"struct", "union"}
-    ):
-        if "true" in member.optional:
-            return f"{name} ? &{name}->get() : nullptr"
-        return f"&{name}"
-    if member.pointer_depth == 0 and member.type in registry.types:
-        category = registry.types[member.type].category
-        if category == "handle":
-            if "true" in member.optional:
-                return f"{name} ? {name}->raw() : {member.type}{{}}"
-            return f"{name}.raw()"
-        if category in {"enum", "bitmask"}:
-            return _native_value(member.type, name, registry)
+def _cpp_type(name: str, ir: IrRegistry, config: GeneratorConfig) -> str:
+    """Map an IR general type name to its C++ wrapper spelling."""
+    if name == "Result":
+        return "ResultCode"
+    if name in {"Flags", "Flags64"}:
+        return "Vk" + name
+    c_name = _c_name(ir, name)
+    if c_name and c_name in config.type_names:
+        return config.type_names[c_name]
+    alias = ir.aliases.get(name)
+    if alias is not None:
+        return _cpp_type(alias.target, ir, config)
+    if name in ir.enums and ir.enums[name].kind in {"enum", "bitmask"}:
+        return name
+    if name in ir.handles or name in ir.structs or name in ir.bitmasks:
+        return name
+    if name in ir.basetypes or name in ir.func_pointers or name in ir.raw_types:
+        return name
     return name
 
 
-def _needs_native_conversion(member: Member, registry: Registry) -> bool:
+def _type_category(name: str, ir: IrRegistry) -> str | None:
+    """Resolved category of an IR general type name.
+
+    Mirrors the old registry ordering: explicit ``<type>`` declarations win
+    over enum groups, so a ``FlagBits`` enum declared with
+    ``<type category="enum">`` is an enum, not a bitmask typedef.
+    """
+    if name in ir.handles:
+        return "handle"
+    if name in ir.structs:
+        return ir.structs[name].category
+    if name in ir.bitmasks:
+        return "bitmask"
+    if name in ir.basetypes:
+        return "basetype"
+    if name in ir.func_pointers:
+        return "funcpointer"
+    alias = ir.aliases.get(name)
+    if alias is not None:
+        return alias.resolved_category or _type_category(alias.target, ir)
+    if name in ir.raw_types:
+        return ir.raw_types[name].category
+    if name in ir.enums:
+        return ir.enums[name].kind if ir.enums[name].kind in {"enum", "bitmask"} else None
+    return None
+
+
+def _as_struct(ir: IrRegistry, name: str) -> Struct | None:
+    resolved = ir.resolve(name)
+    return resolved if isinstance(resolved, Struct) else None
+
+
+def _as_handle(ir: IrRegistry, name: str) -> Handle | None:
+    resolved = ir.resolve(name)
+    return resolved if isinstance(resolved, Handle) else None
+
+
+def _lengths(param: Param) -> tuple[str, ...]:
+    return tuple(length.text for length in param.lengths)
+
+
+def _native_type(param: Param) -> str:
+    prefix = "const " if param.const else ""
+    # Array parameters in C declarations decay to pointers even though the XML
+    # spelling has no `*` token (for example `float values[4]`).
+    depth = param.pointer_depth + (1 if "[" in param.c_suffix else 0)
+    return prefix + param.c_type + "*" * depth
+
+
+def _public_param_name(param: Param) -> str:
+    return param.public_name
+
+
+def _public_param_type(
+    param: Param, ir: IrRegistry, config: GeneratorConfig
+) -> str:
+    cpp = _cpp_type(param.type, ir, config)
+    category = _type_category(param.type, ir)
+    array_sizes = re.findall(r"\[([^\]]+)\]", param.c_suffix)
+    if array_sizes:
+        extent = ", ".join(array_sizes)
+        return f"std::span<{'const ' if param.const else ''}{cpp}, {extent}>"
+    if param.pointer_depth == 0 and not param.c_suffix:
+        # Handle wrappers already carry an empty/null state, so an optional
+        # handle is just a plain (possibly default-constructed) handle ref.
+        if category == "handle":
+            return f"const {cpp}&"
+        return cpp
     if (
-        member.length and "null-terminated" not in member.length
-    ) or "[" in member.declaration:
+        param.const
+        and param.type == "char"
+        and param.pointer_depth == 1
+        and "null-terminated" in _lengths(param)
+    ):
+        return (
+            "std::optional<std::string_view>"
+            if param.is_optional
+            else "std::string_view"
+        )
+    lengths = _lengths(param)
+    if lengths and "null-terminated" not in lengths:
+        if param.type == "void":
+            return (
+                "std::span<const std::byte>" if param.const else "std::span<std::byte>"
+            )
+        return f"std::span<{'const ' if param.const else ''}{cpp}>"
+    is_output = param.direction == "output"
+    if is_output:
+        if param.type == "void":
+            return "void" + "*" * param.pointer_depth
+        return f"{cpp}*"
+    if param.pointer_depth == 1 and category in {"struct", "union"}:
+        if param.is_optional:
+            return f"std::optional<std::reference_wrapper<const {cpp}>>"
+        return f"const {cpp}&"
+    if category is not None:
+        prefix = "const " if param.const else ""
+        return prefix + cpp + "*" * param.pointer_depth
+    return _native_type(param)
+
+
+def _public_argument(
+    param: Param, ir: IrRegistry, name: str | None = None
+) -> str:
+    name = name or _public_param_name(param)
+    lengths = _lengths(param)
+    if (lengths and "null-terminated" not in lengths) or "[" in param.c_suffix:
+        if param.type == "void":
+            return f"reinterpret_cast<{'const ' if param.const else ''}void*>({name}.empty() ? nullptr : {name}.data())"
+        return f"{name}.empty() ? nullptr : {name}.data()"
+    struct = _as_struct(ir, param.type)
+    if (
+        param.const
+        and param.pointer_depth == 1
+        and struct is not None
+        and struct.category in {"struct", "union"}
+    ):
+        if param.is_optional:
+            return f"{name} ? &{name}->get() : nullptr"
+        return f"&{name}"
+    if param.pointer_depth == 0:
+        category = _type_category(param.type, ir)
+        if category == "handle":
+            return f"{name}.raw()"
+        if category in {"enum", "bitmask"}:
+            return _native_value(param.type, name, ir)
+    return name
+
+
+def _needs_native_conversion(param: Param, ir: IrRegistry) -> bool:
+    lengths = _lengths(param)
+    if (lengths and "null-terminated" not in lengths) or "[" in param.c_suffix:
         return True
-    item = registry.types.get(member.type)
-    if item is None:
+    category = _type_category(param.type, ir)
+    if category is None:
         return False
-    return item.category in {"struct", "union"} or (
-        (bool(member.length) or member.pointer_depth > 0 or "[" in member.declaration)
-        and item.category in {"enum", "bitmask", "handle"}
+    return category in {"struct", "union"} or (
+        (bool(lengths) or param.pointer_depth > 0 or "[" in param.c_suffix)
+        and category in {"enum", "bitmask", "handle"}
     )
 
 
-def _cpp_type(type_name: str, registry: Registry, config: GeneratorConfig) -> str:
-    if type_name == "VkResult":
-        return "ResultCode"
-    if type_name in {"VkFlags", "VkFlags64"}:
-        return type_name
-    if type_name in config.type_names:
-        return config.type_names[type_name]
-    if type_name in registry.types and registry.types[type_name].alias:
-        return _cpp_type(registry.types[type_name].alias or type_name, registry, config)
-    # Some extension registries provide an enum group and use it from structs
-    # without retaining a corresponding <type category="enum"> declaration
-    # after API/extension filtering.  The group is still an owned wrapper type.
-    if type_name in registry.enums and registry.enums[type_name].kind in {
-        "enum",
-        "bitmask",
-    }:
-        return strip_vk(type_name)
-    if not type_name.startswith("Vk"):
-        return type_name
-    if type_name in registry.types and registry.types[type_name].category in {
-        "handle",
-        "struct",
-        "union",
-        "enum",
-        "bitmask",
-        "basetype",
-        "funcpointer",
-    }:
-        return strip_vk(type_name)
-    return type_name
-
-
-def _enum_value(value, group: EnumGroup) -> str:
-    if value.alias:
-        return value.alias
+def _enum_value(value: EnumValue, group: Enum) -> str:
+    if value.alias_of:
+        return value.alias_of
     if value.value is not None:
         return value.value
     if value.bitpos is not None:
@@ -227,19 +234,68 @@ def _enum_value(value, group: EnumGroup) -> str:
     return value.name
 
 
-def _emit_enums(registry: Registry, config: GeneratorConfig) -> str:
+def _is_typed_bitmask(name: str, ir: IrRegistry) -> bool:
+    alias = ir.aliases.get(name)
+    if alias is not None:
+        return _is_typed_bitmask(alias.target, ir)
+    bitmask = ir.bitmasks.get(name)
+    if bitmask is None or not bitmask.bits:
+        return False
+    group = ir.enums.get(bitmask.bits)
+    return bool(group and group.values and bitmask.bits in ir.enums)
+
+
+def _native_value(name: str, expression: str, ir: IrRegistry) -> str:
+    if _type_category(name, ir) == "bitmask" and _is_typed_bitmask(name, ir):
+        return f"{expression}.raw()"
+    return f"static_cast<{_c_name(ir, name) or name}>({expression})"
+
+
+def _has_native_definition(struct: Struct) -> bool:
+    return bool(struct.members)
+
+
+def _has_pnext(name: str, ir: IrRegistry) -> bool:
+    struct = _as_struct(ir, name)
+    return bool(struct and any(member.name == "pNext" for member in struct.members))
+
+
+def _output_chain_refresh(name: str, expression: str, ir: IrRegistry) -> str:
+    return (
+        f" {expression}.nextInChain.refresh();"
+        if _has_pnext(name, ir)
+        else ""
+    )
+
+
+def _native_type_name(name: str, ir: IrRegistry) -> str:
+    """Name a C type without resolving to a same-named wrapper."""
+    struct = _as_struct(ir, name)
+    c_name = _c_name(ir, name) or name
+    if struct and struct.members and not c_name.startswith("Vk"):
+        return f"::{c_name}"
+    return c_name
+
+
+# ---------------------------------------------------------------------------
+# Enums / aliases / constants
+# ---------------------------------------------------------------------------
+
+def _emit_enums(ir: IrRegistry, config: GeneratorConfig) -> str:
     output: list[str] = []
-    for group in registry.enums.values():
+    for group in ir.enums.values():
         if group.kind not in {"enum", "bitmask"} or not group.values:
             continue
-        if group.name == "VkResult" or not group.name.startswith("Vk"):
+        if group.c_name == "VkResult" or not group.c_name.startswith("Vk"):
             continue
-        cpp = _cpp_type(group.name, registry, config)
+        cpp = _cpp_type(group.name, ir, config)
         underlying = "std::uint64_t" if group.bitwidth == 64 else "std::int32_t"
-        values = []
+        values: list[str] = []
         used: set[str] = set()
         for value in group.values:
-            name = enum_name(group.name, value.name, registry.tags)
+            if not value.active:
+                continue
+            name = enum_name(group.c_name, value.name, ir.tags)
             if name in used:
                 name += "_" + value.name.rsplit("_", 1)[-1]
             used.add(name)
@@ -258,77 +314,105 @@ def _emit_enums(registry: Registry, config: GeneratorConfig) -> str:
     return "\n\n".join(output)
 
 
-def _emit_aliases(registry: Registry, config: GeneratorConfig) -> str:
+def _emit_aliases(ir: IrRegistry, config: GeneratorConfig) -> str:
     result: list[str] = []
-    for item in registry.types.values():
-        if item.alias:
-            if item.alias not in registry.types:
+    for general in ir.type_order:
+        alias = ir.aliases.get(general)
+        if alias is not None:
+            if not alias.active:
                 continue
-            alias_cpp = config.type_names.get(item.name, strip_vk(item.name))
-            target_group = registry.enums.get(item.alias)
-            # Vulkan deliberately declares some reserved FlagBits names in XML
-            # without a corresponding C/C++ type until the first bit exists.
+            alias_cpp = config.type_names.get(alias.c_name, alias.name)
+            target_c = _c_name(ir, alias.target)
+            if target_c is None:
+                continue
+            target_group = ir.enums.get(alias.target)
             if target_group is not None and not target_group.values:
                 continue
-            target_cpp = _cpp_type(item.alias, registry, config)
+            target_cpp = _cpp_type(alias.target, ir, config)
             if alias_cpp != target_cpp:
                 result.append(
                     _guard(
                         f"using {alias_cpp} = {target_cpp};",
-                        item.protect or item.availability.protect,
+                        alias.protect or alias.availability.protect,
                     )
                 )
-        elif item.category in {
-            "basetype",
-            "funcpointer",
-            "bitmask",
-        } and item.name.startswith("Vk"):
-            if item.name in {"VkFlags", "VkFlags64"}:
+            continue
+        basetype = ir.basetypes.get(general)
+        if basetype is not None:
+            if not basetype.active or basetype.c_name in {"VkFlags", "VkFlags64"}:
                 continue
-            if item.category == "bitmask" and _is_typed_bitmask(item.name, registry):
+            result.append(
+                _guard(
+                    f"using {basetype.name} = {basetype.c_name};",
+                    basetype.protect or basetype.availability.protect,
+                )
+            )
+            continue
+        func_pointer = ir.func_pointers.get(general)
+        if func_pointer is not None:
+            if not func_pointer.active:
+                continue
+            result.append(
+                _guard(
+                    f"using {func_pointer.name} = {func_pointer.c_name};",
+                    func_pointer.protect or func_pointer.availability.protect,
+                )
+            )
+            continue
+        bitmask = ir.bitmasks.get(general)
+        if bitmask is not None:
+            if not bitmask.active or bitmask.c_name in {"VkFlags", "VkFlags64"}:
+                continue
+            if _is_typed_bitmask(bitmask.name, ir):
                 result.append(
                     _guard(
-                        f"using {strip_vk(item.name)} = Flags<{_cpp_type(item.requires, registry, config)}, {item.name}>;",
-                        item.protect or item.availability.protect,
+                        f"using {bitmask.name} = Flags<{_cpp_type(bitmask.bits, ir, config)}, {bitmask.c_name}>;",
+                        bitmask.protect or bitmask.availability.protect,
                     )
                 )
             else:
                 result.append(
                     _guard(
-                        f"using {strip_vk(item.name)} = {item.name};",
-                        item.protect or item.availability.protect,
+                        f"using {bitmask.name} = {bitmask.c_name};",
+                        bitmask.protect or bitmask.availability.protect,
                     )
                 )
-        elif item.category == "union" and _has_native_definition(item):
-            # Vulkan unions already provide the value semantics the wrapper
-            # needs.  Alias them before owned structures are defined so fields
-            # such as VkClearValue are complete at their point of use.
+            continue
+        struct = _as_struct(ir, general)
+        if (
+            struct is not None
+            and struct.category == "union"
+            and struct.members
+            and struct.active
+        ):
             result.append(
                 _guard(
-                    f"using {_cpp_type(item.name, registry, config)} = {item.name};",
-                    item.protect or item.availability.protect,
+                    f"using {_cpp_type(struct.name, ir, config)} = {struct.c_name};",
+                    struct.protect or struct.availability.protect,
                 )
             )
     return "\n".join(result)
 
 
-def _emit_constants(registry: Registry) -> str:
+def _emit_constants(ir: IrRegistry) -> str:
     lines: list[str] = []
     emitted: set[str] = set()
-    for item in registry.constants.values():
-        name = constant_name(item.name, registry.tags)
+    for item in ir.constants.values():
+        if not item.active:
+            continue
+        name = constant_name(item.c_name, ir.tags)
         if name in emitted:
             continue
         emitted.add(name)
-        if item.alias:
-            target = constant_name(item.alias, registry.tags)
+        if item.alias_of:
+            target = constant_name(item.alias_of, ir.tags)
             declaration = f"inline constexpr auto {name} = {target};"
         elif item.value is not None:
-            native_type = item.type or "auto"
+            native_type = item.c_type or "auto"
             declaration = (
-                f"inline constexpr auto {name} = {item.name};"
+                f"inline constexpr auto {name} = {item.c_name};"
                 if native_type == "auto"
-                else f"inline constexpr {native_type} {name} = static_cast<{native_type}>({item.name});"
+                else f"inline constexpr {native_type} {name} = static_cast<{native_type}>({item.c_name});"
             )
         else:
             continue
@@ -336,143 +420,80 @@ def _emit_constants(registry: Registry) -> str:
     return "\n".join(lines)
 
 
-def _member_cpp(member: Member, registry: Registry, config: GeneratorConfig) -> str:
-    value = _cpp_type(member.type, registry, config)
-    array_sizes = re.findall(r"\[([^\]]+)\]", member.declaration)
+def _member_cpp(param: Param, ir: IrRegistry, config: GeneratorConfig) -> str:
+    value = _cpp_type(param.type, ir, config)
+    array_sizes = re.findall(r"\[([^\]]+)\]", param.c_suffix)
     if array_sizes:
         for size in reversed(array_sizes):
             value = f"std::array<{value}, {size}>"
         return value
-    if member.pointer_depth:
+    if param.pointer_depth:
+        lengths = _lengths(param)
         if (
-            member.const
-            and member.type == "char"
-            and member.pointer_depth == 2
-            and member.length
+            param.const
+            and param.type == "char"
+            and param.pointer_depth == 2
+            and lengths
         ):
             return "std::vector<std::string>"
-        if value == "void" and member.length:
+        if value == "void" and lengths:
             return (
                 "std::vector<std::byte>"
-                if member.pointer_depth == 1
+                if param.pointer_depth == 1
                 else "std::vector<const void*>"
             )
         if (
-            member.const
-            and member.type == "char"
-            and "null-terminated" in member.length
+            param.const
+            and param.type == "char"
+            and "null-terminated" in lengths
         ):
             return "std::string"
-        if member.length and any(
-            length != "null-terminated" for length in member.length
-        ):
+        if lengths and any(length != "null-terminated" for length in lengths):
             return f"std::vector<{value}>"
         if (
-            member.pointer_depth == 1
-            and _type_category(member.type, registry) == "struct"
+            param.pointer_depth == 1
+            and _type_category(param.type, ir) == "struct"
         ):
-            return f"std::optional<{value}>" if "true" in member.optional else value
+            return f"std::optional<{value}>" if param.is_optional else value
         if (
-            member.pointer_depth == 1
-            and _type_category(member.type, registry) == "native_struct"
+            param.pointer_depth == 1
+            and _type_category(param.type, ir) == "native_struct"
         ):
             return f"std::optional<{value}>"
-        if member.pointer_depth == 1 and _type_category(member.type, registry) in {
+        if param.pointer_depth == 1 and _type_category(param.type, ir) in {
             "enum",
             "bitmask",
         }:
             return f"std::optional<{value}>"
-        if member.pointer_depth == 1 and "true" in member.optional and value != "void":
+        if param.pointer_depth == 1 and param.is_optional and value != "void":
             return f"std::optional<{value}>"
-        if member.type in registry.types:
+        if ir.resolve(param.type) is not None:
             return (
-                ("const " if member.const else "") + value + "*" * member.pointer_depth
+                ("const " if param.const else "") + value + "*" * param.pointer_depth
             )
-        return _native_type(member)
+        return _native_type(param)
     return value
 
 
-def _safe_default(member: Member, cpp_type: str) -> str:
-    if member.values:
-        return f"{{static_cast<{cpp_type}>({member.values})}}"
+def _safe_default(param: Param, cpp_type: str) -> str:
+    if param.values:
+        return f"{{static_cast<{cpp_type}>({param.values})}}"
     return "{}"
 
 
-def _type_category(type_name: str, registry: Registry) -> str | None:
-    item = registry.types.get(type_name)
-    if item:
-        return item.category
-    group = registry.enums.get(type_name)
-    return group.kind if group and group.kind in {"enum", "bitmask"} else None
+# ---------------------------------------------------------------------------
+# Struct helpers
+# ---------------------------------------------------------------------------
 
-
-def _is_typed_bitmask(type_name: str, registry: Registry) -> bool:
-    seen: set[str] = set()
-    item = registry.types.get(type_name)
-    while item and item.alias and item.name not in seen:
-        seen.add(item.name)
-        item = registry.types.get(item.alias)
-    if not item or item.category != "bitmask" or not item.requires:
-        return False
-    group = registry.enums.get(item.requires)
-    return bool(group and group.values and item.requires.startswith("Vk"))
-
-
-def _native_value(type_name: str, expression: str, registry: Registry) -> str:
-    if _type_category(type_name, registry) == "bitmask" and _is_typed_bitmask(
-        type_name, registry
-    ):
-        return f"{expression}.raw()"
-    return f"static_cast<{type_name}>({expression})"
-
-
-def _has_native_definition(item: TypeDecl) -> bool:
-    # Supplemental registries (notably video.xml) define ordinary C structs
-    # whose names do not begin with Vk.  They still need the same owned wrapper
-    # treatment whenever a definition, rather than a forward placeholder, is
-    # present.
-    return item.category in {"struct", "union"} and bool(item.members)
-
-
-def _has_pnext(type_name: str, registry: Registry) -> bool:
-    item = registry.types.get(type_name)
-    return bool(item and any(member.name == "pNext" for member in item.members))
-
-
-def _output_chain_refresh(type_name: str, expression: str, registry: Registry) -> str:
-    return (
-        f" {expression}.nextInChain.refresh();"
-        if _has_pnext(type_name, registry)
-        else ""
-    )
-
-
-def _native_type_name(type_name: str, registry: Registry) -> str:
-    """Name a C type without resolving to a same-named wrapper.
-
-    VkFoo wrappers are named Foo and therefore do not shadow VkFoo.  A
-    supplemental type such as StdVideoFoo keeps its public name, so its native
-    spelling must be explicitly qualified from inside namespace vk.
-    """
-    item = registry.types.get(type_name)
-    if item and _has_native_definition(item) and not type_name.startswith("Vk"):
-        return f"::{type_name}"
-    return type_name
-
-
-def _count_sources(item: TypeDecl) -> dict[str, Member]:
-    result: dict[str, Member] = {}
-    member_names = {member.name for member in item.members}
-    for member in item.members:
-        if "[" in member.declaration:
+def _count_sources(struct: Struct) -> dict[str, Param]:
+    result: dict[str, Param] = {}
+    member_names = {member.name for member in struct.members}
+    for member in struct.members:
+        if "[" in member.c_suffix:
             continue
-        for length in member.length:
+        for length in _lengths(member):
             if re.fullmatch(r"[A-Za-z_]\w*", length):
                 result.setdefault(length, member)
-        # `len` is sometimes LaTeX while `altlen` carries the machine-readable
-        # form.  A quotient such as codeSize / 4 is an invertible byte-count
-        # relationship, so the count is derived from the owned vector.  Do not
-        # collapse semantic sizing inputs such as rasterizationSamples.
         expression = (member.alt_length or "").strip()
         quotient = re.fullmatch(r"([A-Za-z_]\w*)\s*/\s*([1-9]\d*)", expression)
         if quotient and quotient.group(1) in member_names:
@@ -485,11 +506,11 @@ def _context_length_name(key: str) -> str:
     return "context" + "".join(part[:1].upper() + part[1:] for part in parts)
 
 
-def _direct_context_lengths(item: TypeDecl) -> tuple[str, ...]:
+def _direct_context_lengths(struct: Struct) -> tuple[str, ...]:
     result: list[str] = []
-    for member in item.members:
+    for member in struct.members:
         for expression in (
-            *member.length,
+            *_lengths(member),
             *((member.alt_length,) if member.alt_length else ()),
         ):
             for match in re.finditer(r"\*_([A-Za-z_]\w*)", expression):
@@ -498,12 +519,12 @@ def _direct_context_lengths(item: TypeDecl) -> tuple[str, ...]:
     return tuple(result)
 
 
-def _context_length_source(item: TypeDecl, key: str) -> Member | None:
+def _context_length_source(struct: Struct, key: str) -> Param | None:
     suffix = "_" + key
     return next(
         (
             member
-            for member in item.members
+            for member in struct.members
             if member.pointer_depth == 0
             and (member.name == key or member.name.endswith(suffix))
         ),
@@ -512,39 +533,27 @@ def _context_length_source(item: TypeDecl, key: str) -> Member | None:
 
 
 def _struct_context_lengths(
-    item: TypeDecl, registry: Registry, visiting: set[str] | None = None
+    struct: Struct, ir: IrRegistry, visiting: set[str] | None = None
 ) -> tuple[str, ...]:
-    """Contextual native array counts not stored by this structure.
-
-    Supplemental registry expressions such as `*_max_sub_layers_minus1 + 1`
-    deliberately refer to a field in an enclosing structure.  Propagate that
-    requirement through nested owned records until a concrete suffix-matching
-    member supplies it.
-    """
     visiting = set() if visiting is None else visiting
-    if item.name in visiting:
+    if struct.name in visiting:
         return ()
-    visiting.add(item.name)
-    required = list(_direct_context_lengths(item))
-    for member in item.members:
-        nested = registry.types.get(member.type)
-        if (
-            not nested
-            or nested.category != "struct"
-            or not _has_native_definition(nested)
-        ):
+    visiting.add(struct.name)
+    required = list(_direct_context_lengths(struct))
+    for member in struct.members:
+        nested = _as_struct(ir, member.type)
+        if not nested or nested.category != "struct" or not nested.members:
             continue
-        for key in _struct_context_lengths(nested, registry, visiting):
-            if _context_length_source(item, key) is None and key not in required:
+        for key in _struct_context_lengths(nested, ir, visiting):
+            if _context_length_source(struct, key) is None and key not in required:
                 required.append(key)
-    visiting.remove(item.name)
+    visiting.remove(struct.name)
     return tuple(required)
 
 
-def _native_array_size(member: Member, item: TypeDecl) -> str | None:
-    """Translate registry len/altlen syntax to an expression over `native`."""
-    expression = member.alt_length or next(
-        (length for length in member.length if length != "null-terminated"), None
+def _native_array_size(param: Param, struct: Struct) -> str | None:
+    expression = param.alt_length or next(
+        (length for length in _lengths(param) if length != "null-terminated"), None
     )
     if not expression or expression == "1":
         return expression
@@ -553,7 +562,7 @@ def _native_array_size(member: Member, item: TypeDecl) -> str | None:
         lambda match: _context_length_name(match.group(1)),
         expression,
     )
-    names = {value.name for value in item.members}
+    names = {value.name for value in struct.members}
     return re.sub(
         r"\b[A-Za-z_]\w*\b",
         lambda match: (
@@ -563,7 +572,7 @@ def _native_array_size(member: Member, item: TypeDecl) -> str | None:
     )
 
 
-def _native_count_value(count: Member, source: Member, source_field: str) -> str:
+def _native_count_value(count: Param, source: Param, source_field: str) -> str:
     expression = (source.alt_length or "").strip()
     quotient = re.fullmatch(rf"{re.escape(count.name)}\s*/\s*([1-9]\d*)", expression)
     if quotient:
@@ -571,21 +580,27 @@ def _native_count_value(count: Member, source: Member, source_field: str) -> str
     return f"{source_field}.size()"
 
 
-def _safe_native_count_value(
-    count: Member,
-    item: TypeDecl,
-    field_names: dict[str, str],
-) -> str:
-    """Derive a count that cannot exceed any supplied parallel array.
+def _array_members(struct: Struct) -> dict[str, list[Param]]:
+    result: dict[str, list[Param]] = {}
+    for member in struct.members:
+        if "[" in member.c_suffix:
+            continue
+        for length in _lengths(member):
+            if (
+                length
+                and length != "null-terminated"
+                and re.fullmatch(r"[A-Za-z_]\w*", length)
+            ):
+                result.setdefault(length, []).append(member)
+    return result
 
-    Registry count members sometimes govern parallel arrays and sometimes
-    mutually exclusive pointer alternatives.  The smallest non-empty capacity
-    handles both: alternatives can be supplied independently, while parallel
-    arrays are never exposed to native code past their backing storage.
-    """
-    sources = _array_members(item).get(count.name, ())
+
+def _safe_native_count_value(
+    count: Param, struct: Struct, field_names: dict[str, str]
+) -> str:
+    sources = _array_members(struct).get(count.name, ())
     if not sources:
-        expression_source = _count_sources(item).get(count.name)
+        expression_source = _count_sources(struct).get(count.name)
         sources = (expression_source,) if expression_source else ()
     if not sources:
         return "0"
@@ -601,13 +616,12 @@ def _safe_native_count_value(
     required = [
         value
         for source, value in entries
-        if not (source.optional and source.optional[0] == "true")
-        and not source.no_auto_validity
+        if not source.is_optional and not source.no_auto_validity
     ]
     conditional = [
         value
         for source, value in entries
-        if (source.optional and source.optional[0] == "true") or source.no_auto_validity
+        if source.is_optional or source.no_auto_validity
     ]
     if required:
         initial, *remaining = required
@@ -634,66 +648,65 @@ def _safe_native_count_value(
 
 
 def _struct_from_parent_types(
-    item: TypeDecl, registry: Registry, visiting: set[str] | None = None
+    struct: Struct, ir: IrRegistry, visiting: set[str] | None = None
 ) -> tuple[str, ...]:
-    """Concrete immediate parents needed to reconstruct handles in a struct."""
     visiting = set() if visiting is None else visiting
-    if item.name in visiting:
+    if struct.name in visiting:
         return ()
-    visiting.add(item.name)
+    visiting.add(struct.name)
     result: list[str] = []
-    for member in item.members:
-        category = _type_category(member.type, registry)
+    for member in struct.members:
+        category = _type_category(member.type, ir)
         if category == "handle":
-            handle = registry.types.get(member.type)
-            parent = handle.parent.split(",")[0] if handle and handle.parent else None
+            handle = _as_handle(ir, member.type)
+            parent = handle.parent if handle else None
             if parent and parent not in result:
                 result.append(parent)
         elif category == "struct":
-            nested = registry.types.get(member.type)
+            nested = _as_struct(ir, member.type)
             if nested:
-                for parent in _struct_from_parent_types(nested, registry, visiting):
+                for parent in _struct_from_parent_types(nested, ir, visiting):
                     if parent not in result:
                         result.append(parent)
-    visiting.remove(item.name)
+    visiting.remove(struct.name)
     return tuple(result)
 
 
 def _from_parent_name(
-    type_name: str, registry: Registry, config: GeneratorConfig
+    type_name: str, ir: IrRegistry, config: GeneratorConfig
 ) -> str:
-    return "owner" + _cpp_type(type_name, registry, config)
+    return "owner" + _cpp_type(type_name, ir, config)
 
 
 def _struct_from_parameters(
-    item: TypeDecl, registry: Registry, config: GeneratorConfig
+    struct: Struct, ir: IrRegistry, config: GeneratorConfig
 ) -> str:
     parents = "".join(
-        f", const {_cpp_type(parent, registry, config)}& {_from_parent_name(parent, registry, config)}"
-        for parent in _struct_from_parent_types(item, registry)
+        f", const {_cpp_type(parent, ir, config)}& {_from_parent_name(parent, ir, config)}"
+        for parent in _struct_from_parent_types(struct, ir)
     )
     contexts = "".join(
         f", std::size_t {_context_length_name(key)}"
-        for key in _struct_context_lengths(item, registry)
+        for key in _struct_context_lengths(struct, ir)
     )
     return parents + contexts
 
 
 def _nested_from_arguments(
     type_name: str,
-    registry: Registry,
+    ir: IrRegistry,
     config: GeneratorConfig,
-    container: TypeDecl | None = None,
+    container: Struct | None = None,
 ) -> str:
-    nested = registry.types.get(type_name)
+    nested = _as_struct(ir, type_name)
     if not nested:
         return ""
     parents = "".join(
-        f", {_from_parent_name(parent, registry, config)}"
-        for parent in _struct_from_parent_types(nested, registry)
+        f", {_from_parent_name(parent, ir, config)}"
+        for parent in _struct_from_parent_types(nested, ir)
     )
     contexts: list[str] = []
-    for key in _struct_context_lengths(nested, registry):
+    for key in _struct_context_lengths(nested, ir):
         source = _context_length_source(container, key) if container else None
         expression = f"native.{source.name}" if source else _context_length_name(key)
         contexts.append(f", static_cast<std::size_t>({expression})")
@@ -704,47 +717,26 @@ def _borrow_handle_lines(
     target: str,
     source: str,
     type_name: str,
-    registry: Registry,
+    ir: IrRegistry,
     config: GeneratorConfig,
     indent: str = "    ",
 ) -> list[str]:
-    cpp = _cpp_type(type_name, registry, config)
-    handle = registry.types[type_name]
-    parent = handle.parent.split(",")[0] if handle.parent else None
-    parent_arg = f", {_from_parent_name(parent, registry, config)}" if parent else ""
+    cpp = _cpp_type(type_name, ir, config)
+    handle = ir.handles[type_name]
+    parent = handle.parent
+    parent_arg = f", {_from_parent_name(parent, ir, config)}" if parent else ""
+    c_type = handle.c_name
     return [
-        f"{indent}if ({source} == {type_name}{{}}) {target}.reset();",
+        f"{indent}if ({source} == {c_type}{{}}) {target}.reset();",
         f'{indent}else {{ auto wrapped = {cpp}::borrow({source}{parent_arg}); if (wrapped) {target} = std::move(*wrapped); else {{ {target}.reset(); detail::report_error(wrapped.error(), "{cpp}", detail::raw_key({source})); }} }}',
     ]
 
 
-def _array_members(item: TypeDecl) -> dict[str, list[Member]]:
-    result: dict[str, list[Member]] = {}
-    for member in item.members:
-        if "[" in member.declaration:
-            continue
-        for length in member.length:
-            if (
-                length
-                and length != "null-terminated"
-                and re.fullmatch(r"[A-Za-z_]\w*", length)
-            ):
-                result.setdefault(length, []).append(member)
-    return result
-
-
-def _struct_member_names(item: TypeDecl) -> dict[str, str]:
-    """Map C member names to stable C++ owned-field names.
-
-    Pointer spelling is an implementation detail of the C ABI.  A counted
-    `pProfiles` member is therefore exposed as `profiles`; its paired count is
-    omitted entirely.  If Vulkan supplies both pX and ppX alternatives, the
-    latter receives a `Pointers` suffix rather than colliding.
-    """
-    omitted = set(_count_sources(item))
+def _struct_member_names(struct: Struct) -> dict[str, str]:
+    omitted = set(_count_sources(struct))
     result: dict[str, str] = {}
     used: set[str] = set()
-    for member in item.members:
+    for member in struct.members:
         if member.name in omitted:
             continue
         name = member.name
@@ -760,13 +752,14 @@ def _struct_member_names(item: TypeDecl) -> dict[str, str]:
 
 
 def _cstruct_cache_lines(
-    item: TypeDecl, registry: Registry, config: GeneratorConfig
+    struct: Struct, ir: IrRegistry, config: GeneratorConfig
 ) -> list[str]:
     lines: list[str] = []
-    for member in item.members:
-        category = _type_category(member.type, registry)
-        cpp = _cpp_type(member.type, registry, config)
-        array_sizes = re.findall(r"\[([^\]]+)\]", member.declaration)
+    for member in struct.members:
+        category = _type_category(member.type, ir)
+        cpp = _cpp_type(member.type, ir, config)
+        array_sizes = re.findall(r"\[([^\]]+)\]", member.c_suffix)
+        lengths = _lengths(member)
         if member.name == "pNext":
             continue
         if array_sizes and category == "struct":
@@ -778,28 +771,28 @@ def _cstruct_cache_lines(
             member.const
             and member.type == "char"
             and member.pointer_depth == 2
-            and member.length
+            and lengths
         ):
             lines.append(f"        std::vector<const char*> {member.name}_native;")
-        elif not array_sizes and member.length and category == "struct":
+        elif not array_sizes and lengths and category == "struct":
             lines.append(f"        std::vector<{cpp}::CStruct> {member.name}_cache;")
             lines.append(
-                f"        std::vector<{_native_type_name(member.type, registry)}> {member.name}_native;"
+                f"        std::vector<{_native_type_name(member.type, ir)}> {member.name}_native;"
             )
             if member.pointer_depth > 1:
                 lines.append(
-                    f"        std::vector<const {_native_type_name(member.type, registry)}*> {member.name}_pointers;"
+                    f"        std::vector<const {_native_type_name(member.type, ir)}*> {member.name}_pointers;"
                 )
         elif (
             not array_sizes
-            and member.length
+            and lengths
             and category in {"handle", "enum", "bitmask"}
         ):
             lines.append(
-                f"        std::vector<{_native_type_name(member.type, registry)}> {member.name}_native;"
+                f"        std::vector<{_native_type_name(member.type, ir)}> {member.name}_native;"
             )
         elif member.pointer_depth == 1 and category == "struct":
-            if "true" in member.optional:
+            if member.is_optional:
                 lines.append(
                     f"        std::optional<{cpp}::CStruct> {member.name}_cache;"
                 )
@@ -807,73 +800,74 @@ def _cstruct_cache_lines(
                 lines.append(f"        {cpp}::CStruct {member.name}_cache{{}};")
         elif (
             member.pointer_depth == 1
-            and ("true" in member.optional or category in {"enum", "bitmask"})
+            and (member.is_optional or category in {"enum", "bitmask"})
             and member.type != "void"
         ):
             lines.append(
-                f"        std::optional<{_native_type_name(member.type, registry)}> {member.name}_native;"
+                f"        std::optional<{_native_type_name(member.type, ir)}> {member.name}_native;"
             )
         elif (
             member.pointer_depth == 0
             and category == "struct"
-            and "[" not in member.declaration
+            and "[" not in member.c_suffix
         ):
             lines.append(f"        {cpp}::CStruct {member.name}_cache{{}};")
     return lines
 
 
 def _emit_struct(
-    item: TypeDecl, registry: Registry, config: GeneratorConfig, injection: list[str]
+    struct: Struct, ir: IrRegistry, config: GeneratorConfig, injection: list[str]
 ) -> str:
-    name = _cpp_type(item.name, registry, config)
-    if item.alias:
-        return ""
-    if not _has_native_definition(item):
+    name = _cpp_type(struct.name, ir, config)
+    if not struct.members:
         return _guard(
-            f"using {name} = {item.name};", item.protect or item.availability.protect
+            f"using {name} = {struct.c_name};",
+            struct.protect or struct.availability.protect,
         )
-    if item.category == "union":
+    if struct.category == "union":
         return _guard(
-            f"using {name} = {item.name};", item.protect or item.availability.protect
+            f"using {name} = {struct.c_name};",
+            struct.protect or struct.availability.protect,
         )
-    field_names = _struct_member_names(item)
+    field_names = _struct_member_names(struct)
     lines = [
         f"struct {name} {{",
-        f"    using native_type = {_native_type_name(item.name, registry)};",
+        f"    using native_type = {_native_type_name(struct.name, ir)};",
         "    static constexpr bool binary_compatible = false;",
         "    struct CStruct {",
         "        native_type value{};",
     ]
-    lines.extend(_cstruct_cache_lines(item, registry, config))
+    lines.extend(_cstruct_cache_lines(struct, ir, config))
     lines.extend(["    };"])
-    for member in item.members:
+    for member in struct.members:
         if member.name not in field_names:
             continue
         field_name = field_names[member.name]
         if member.name == "sType" and member.values:
+            cpp = _cpp_type(member.type, ir, config)
             lines.append(
-                f"    {_cpp_type(member.type, registry, config)} {field_name}{{static_cast<{_cpp_type(member.type, registry, config)}>({member.values})}};"
+                f"    {cpp} {field_name}{{static_cast<{cpp}>({member.values})}};"
             )
         elif member.name == "pNext":
             lines.append("    ExtensionChain nextInChain{};")
         else:
-            member_type = _member_cpp(member, registry, config)
+            member_type = _member_cpp(member, ir, config)
             lines.append(
                 f"    {member_type} {field_name}{_safe_default(member, member_type)};"
             )
-    for member in item.members:
+    for member in struct.members:
         if member.name in {"sType", "pNext"} or member.name not in field_names:
             continue
         field_name = field_names[member.name]
         method = field_name[:1].upper() + field_name[1:]
-        cpp = _member_cpp(member, registry, config)
+        cpp = _member_cpp(member, ir, config)
         lines.append(
             f"    {name}& set{method}({cpp} value) & {{ {field_name} = std::move(value); return *this; }}"
         )
         lines.append(
             f"    {name}&& set{method}({cpp} value) && {{ {field_name} = std::move(value); return std::move(*this); }}"
         )
-    if "pNext" in {member.name for member in item.members}:
+    if "pNext" in {member.name for member in struct.members}:
         lines.append(
             f"    template <typename T> requires StructureExtends<{name}, std::remove_cvref_t<T>>::value"
         )
@@ -890,87 +884,84 @@ def _emit_struct(
     lines.extend(
         [
             "    void to_cstruct(CStruct* output) const;",
-            f"    void from_cstruct(const native_type& input{_struct_from_parameters(item, registry, config)});",
+            f"    void from_cstruct(const native_type& input{_struct_from_parameters(struct, ir, config)});",
             "    void from_output_cstruct(const native_type& input);",
             "};",
         ]
     )
-    return _guard("\n".join(lines), item.protect or item.availability.protect)
+    return _guard("\n".join(lines), struct.protect or struct.availability.protect)
 
 
 def _emit_structs(
-    registry: Registry, config: GeneratorConfig, template: Template
+    ir: IrRegistry, config: GeneratorConfig, template: Template
 ) -> str:
     items = [
-        item
-        for item in registry.structs
-        if not item.alias and item.category == "struct" and _has_native_definition(item)
+        struct
+        for struct in ir.structs.values()
+        if struct.category == "struct" and struct.active and struct.members
     ]
-    names = {item.name for item in items}
+    names = {struct.name for struct in items}
     emitted: set[str] = set()
-    ordered: list[TypeDecl] = []
+    ordered: list[Struct] = []
     while len(ordered) != len(items):
         progress = False
-        for item in items:
-            if item.name in emitted:
+        for struct in items:
+            if struct.name in emitted:
                 continue
-            dependencies = set()
-            for member in item.members:
-                dependency = registry.types.get(member.type)
-                dependency_name = (
-                    dependency.alias if dependency and dependency.alias else member.type
-                )
-                if dependency_name not in names or dependency_name == item.name:
+            dependencies: set[str] = set()
+            for member in struct.members:
+                resolved = ir.resolve(member.type)
+                dependency = resolved.name if resolved is not None else member.type
+                if dependency not in names or dependency == struct.name:
                     continue
                 owns_value = member.pointer_depth == 0 or (
                     member.type in names and member.pointer_depth > 0
                 )
                 if owns_value:
-                    dependencies.add(dependency_name)
+                    dependencies.add(dependency)
             if dependencies <= emitted:
-                ordered.append(item)
-                emitted.add(item.name)
+                ordered.append(struct)
+                emitted.add(struct.name)
                 progress = True
         if not progress:
-            # Vulkan structs can have pointer cycles, but owned-value cycles are
-            # impossible in C. Preserve deterministic registry order if malformed
-            # supplemental input nevertheless creates one.
-            ordered.extend(item for item in items if item.name not in emitted)
+            ordered.extend(struct for struct in items if struct.name not in emitted)
             break
     structs = "\n\n".join(
         _emit_struct(
-            item,
-            registry,
+            struct,
+            ir,
             config,
-            template.injections.get(_cpp_type(item.name, registry, config), []),
+            template.injections.get(_cpp_type(struct.name, ir, config), []),
         )
-        for item in ordered
+        for struct in ordered
     )
     records: list[str] = []
-    for handle in registry.handles:
-        if handle.alias:
+    for handle in ir.handles.values():
+        if not handle.active:
             continue
-        alternatives = creation_infos_for_handle(registry, handle)
+        alternatives = tuple(
+            alt for alt in handle.create_infos if alt in ir.structs
+        )
         if len(alternatives) < 2:
             continue
-        name = f"{_cpp_type(handle.name, registry, config)}CreationRecord"
+        name = f"{_cpp_type(handle.name, ir, config)}CreationRecord"
         lines = [
             f"struct {name} {{",
             "    using Value = std::variant<",
             "        std::monostate",
         ]
         for alternative in alternatives:
-            item = registry.types[alternative]
-            value = f"        , {_cpp_type(alternative, registry, config)}"
-            lines.append(_guard(value, item.protect or item.availability.protect))
+            struct = ir.structs[alternative]
+            value = f"        , {_cpp_type(alternative, ir, config)}"
+            lines.append(_guard(value, struct.protect or struct.availability.protect))
         lines.extend(["    >;", "    Value value{};", f"    {name}() = default;"])
         for alternative in alternatives:
-            item = registry.types[alternative]
-            cpp = _cpp_type(alternative, registry, config)
+            struct = ir.structs[alternative]
+            cpp = _cpp_type(alternative, ir, config)
             lines.append(
                 _guard(
                     f"    {name}(const {cpp}& input) : value(input) {{}}",
-                    item.protect or item.availability.protect,
+                    struct.protect or struct.availability.protect,
                 )
             )
         lines.append("};")
@@ -978,40 +969,40 @@ def _emit_structs(
     return structs + ("\n\n" if structs and records else "") + "\n\n".join(records)
 
 
-def _to_native_scalar(member: Member, expression: str, registry: Registry) -> str:
-    category = _type_category(member.type, registry)
+def _to_native_scalar(param: Param, expression: str, ir: IrRegistry) -> str:
+    category = _type_category(param.type, ir)
     if category == "handle":
         return f"{expression}.raw()"
     if category in {"enum", "bitmask"}:
-        return _native_value(member.type, expression, registry)
+        return _native_value(param.type, expression, ir)
     return expression
 
 
 def _emit_struct_impl(
-    item: TypeDecl, registry: Registry, config: GeneratorConfig
+    struct: Struct, ir: IrRegistry, config: GeneratorConfig
 ) -> str:
-    if item.alias or not _has_native_definition(item):
+    if not struct.members:
         return ""
-    name = _cpp_type(item.name, registry, config)
-    counts = _count_sources(item)
-    field_names = _struct_member_names(item)
+    name = _cpp_type(struct.name, ir, config)
+    counts = _count_sources(struct)
+    field_names = _struct_member_names(struct)
     lines = [
         f"inline void {name}::to_cstruct(CStruct* output) const {{",
         "    if (!output) return;",
         "    output->value = {};",
     ]
-    for member in item.members:
-        category = _type_category(member.type, registry)
+    for member in struct.members:
+        category = _type_category(member.type, ir)
         target = f"output->value.{member.name}"
         field = field_names.get(member.name, member.name)
-        array_sizes = re.findall(r"\[([^\]]+)\]", member.declaration)
+        array_sizes = re.findall(r"\[([^\]]+)\]", member.c_suffix)
         if member.name == "pNext":
             lines.append(
                 f"    {target} = reinterpret_cast<decltype({target})>(const_cast<void*>(nextInChain.native()));"
             )
         elif member.name in counts:
-            count_value = _safe_native_count_value(member, item, field_names)
-            lines.append(f"    {target} = static_cast<{member.type}>({count_value});")
+            count_value = _safe_native_count_value(member, struct, field_names)
+            lines.append(f"    {target} = static_cast<{member.c_type}>({count_value});")
         elif array_sizes:
             if category == "struct":
                 lines.append(
@@ -1023,7 +1014,7 @@ def _emit_struct_impl(
                 )
             elif category in {"enum", "bitmask"}:
                 lines.append(
-                    f"    for (std::size_t i = 0; i < {field}.size(); ++i) {target}[i] = {_native_value(member.type, f'{field}[i]', registry)};"
+                    f"    for (std::size_t i = 0; i < {field}.size(); ++i) {target}[i] = {_native_value(member.type, f'{field}[i]', ir)};"
                 )
             else:
                 lines.append(
@@ -1033,11 +1024,11 @@ def _emit_struct_impl(
             member.const
             and member.type == "char"
             and member.pointer_depth == 1
-            and "null-terminated" in member.length
+            and "null-terminated" in _lengths(member)
         ):
             lines.append(f"    {target} = {field}.c_str();")
-        elif member.length and any(
-            length != "null-terminated" for length in member.length
+        elif _lengths(member) and any(
+            length != "null-terminated" for length in _lengths(member)
         ):
             if member.type == "char" and member.pointer_depth == 2:
                 lines.extend(
@@ -1048,7 +1039,7 @@ def _emit_struct_impl(
                     ]
                 )
             elif category == "struct":
-                cpp = _cpp_type(member.type, registry, config)
+                cpp = _cpp_type(member.type, ir, config)
                 lines.extend(
                     [
                         f"    output->{member.name}_cache.resize({field}.size());",
@@ -1072,7 +1063,7 @@ def _emit_struct_impl(
                 transform = (
                     f"{field}[i].raw()"
                     if category == "handle"
-                    else _native_value(member.type, f"{field}[i]", registry)
+                    else _native_value(member.type, f"{field}[i]", ir)
                 )
                 lines.extend(
                     [
@@ -1087,7 +1078,7 @@ def _emit_struct_impl(
                     f"    {target} = reinterpret_cast<decltype({target})>(const_cast<void*>(static_cast<const void*>({pointer})));"
                 )
         elif member.pointer_depth == 1 and category == "struct":
-            if "true" in member.optional:
+            if member.is_optional:
                 lines.extend(
                     [
                         f"    output->{member.name}_cache.reset();",
@@ -1104,12 +1095,12 @@ def _emit_struct_impl(
                 )
         elif (
             member.pointer_depth == 1
-            and ("true" in member.optional or category in {"enum", "bitmask"})
+            and (member.is_optional or category in {"enum", "bitmask"})
             and member.type != "void"
         ):
             lines.extend(
                 [
-                    f"    output->{member.name}_native = {field} ? std::optional<{_native_type_name(member.type, registry)}>({_native_value(member.type, f'*{field}', registry)}) : std::nullopt;",
+                    f"    output->{member.name}_native = {field} ? std::optional<{_native_type_name(member.type, ir)}>({_native_value(member.type, f'*{field}', ir)}) : std::nullopt;",
                     f"    {target} = output->{member.name}_native ? &*output->{member.name}_native : nullptr;",
                 ]
             )
@@ -1124,26 +1115,24 @@ def _emit_struct_impl(
             lines.append(f"    {target} = {field};")
         else:
             lines.append(
-                f"    {target} = {_to_native_scalar(member, field, registry)};"
+                f"    {target} = {_to_native_scalar(member, field, ir)};"
             )
     lines.extend(
         [
             "}",
-            f"inline void {name}::from_cstruct(const native_type& native{_struct_from_parameters(item, registry, config)}) {{",
+            f"inline void {name}::from_cstruct(const native_type& native{_struct_from_parameters(struct, ir, config)}) {{",
         ]
     )
-    for member in item.members:
-        category = _type_category(member.type, registry)
+    for member in struct.members:
+        category = _type_category(member.type, ir)
         source = f"native.{member.name}"
         field = field_names.get(member.name, member.name)
-        array_sizes = re.findall(r"\[([^\]]+)\]", member.declaration)
+        array_sizes = re.findall(r"\[([^\]]+)\]", member.c_suffix)
         if member.name == "pNext" or member.name in counts:
             continue
         if array_sizes:
             if category == "struct":
-                nested_args = _nested_from_arguments(
-                    member.type, registry, config, item
-                )
+                nested_args = _nested_from_arguments(member.type, ir, config, struct)
                 lines.append(
                     f"    for (std::size_t i = 0; i < {field}.size(); ++i) {field}[i].from_cstruct({source}[i]{nested_args});"
                 )
@@ -1151,18 +1140,13 @@ def _emit_struct_impl(
                 lines.append(f"    for (std::size_t i = 0; i < {field}.size(); ++i) {{")
                 lines.extend(
                     _borrow_handle_lines(
-                        f"{field}[i]",
-                        f"{source}[i]",
-                        member.type,
-                        registry,
-                        config,
-                        "        ",
+                        f"{field}[i]", f"{source}[i]", member.type, ir, config, "        "
                     )
                 )
                 lines.append("    }")
             elif category in {"enum", "bitmask"}:
                 lines.append(
-                    f"    for (std::size_t i = 0; i < {field}.size(); ++i) {field}[i] = static_cast<{_cpp_type(member.type, registry, config)}>({source}[i]);"
+                    f"    for (std::size_t i = 0; i < {field}.size(); ++i) {field}[i] = static_cast<{_cpp_type(member.type, ir, config)}>({source}[i]);"
                 )
             else:
                 lines.append(
@@ -1173,14 +1157,14 @@ def _emit_struct_impl(
             member.const
             and member.type == "char"
             and member.pointer_depth == 1
-            and "null-terminated" in member.length
+            and "null-terminated" in _lengths(member)
         ):
             lines.append(f'    {field} = {source} ? {source} : "";')
             continue
-        if member.length and any(
-            length != "null-terminated" for length in member.length
+        if _lengths(member) and any(
+            length != "null-terminated" for length in _lengths(member)
         ):
-            count_source = _native_array_size(member, item)
+            count_source = _native_array_size(member, struct)
             if not count_source:
                 lines.append(f"    {field}.clear();")
                 continue
@@ -1201,9 +1185,7 @@ def _emit_struct_impl(
                     f"*{source}[i]" if member.pointer_depth > 1 else f"{source}[i]"
                 )
                 condition = f"if ({source}[i]) " if member.pointer_depth > 1 else ""
-                nested_args = _nested_from_arguments(
-                    member.type, registry, config, item
-                )
+                nested_args = _nested_from_arguments(member.type, ir, config, struct)
                 lines.append(
                     f"        for (std::size_t i = 0; i < {field}.size(); ++i) {condition}{field}[i].from_cstruct({native_value}{nested_args});"
                 )
@@ -1216,17 +1198,12 @@ def _emit_struct_impl(
                 )
                 lines.extend(
                     _borrow_handle_lines(
-                        f"{field}[i]",
-                        f"{source}[i]",
-                        member.type,
-                        registry,
-                        config,
-                        "            ",
+                        f"{field}[i]", f"{source}[i]", member.type, ir, config, "            "
                     )
                 )
                 lines.append("        }")
             elif category in {"enum", "bitmask"}:
-                cpp = _cpp_type(member.type, registry, config)
+                cpp = _cpp_type(member.type, ir, config)
                 lines.append(
                     f"        {field}.resize(static_cast<std::size_t>({count_source}));"
                 )
@@ -1247,8 +1224,8 @@ def _emit_struct_impl(
             lines.append("    }")
             continue
         if member.pointer_depth == 1 and category == "struct":
-            nested_args = _nested_from_arguments(member.type, registry, config, item)
-            if "true" in member.optional:
+            nested_args = _nested_from_arguments(member.type, ir, config, struct)
+            if member.is_optional:
                 lines.append(
                     f"    if ({source}) {{ {field}.emplace(); {field}->from_cstruct(*{source}{nested_args}); }} else {field}.reset();"
                 )
@@ -1259,11 +1236,11 @@ def _emit_struct_impl(
             continue
         if (
             member.pointer_depth == 1
-            and ("true" in member.optional or category in {"enum", "bitmask"})
+            and (member.is_optional or category in {"enum", "bitmask"})
             and member.type != "void"
         ):
             conversion = (
-                f"static_cast<{_cpp_type(member.type, registry, config)}>(*{source})"
+                f"static_cast<{_cpp_type(member.type, ir, config)}>(*{source})"
                 if category in {"enum", "bitmask"}
                 else f"*{source}"
             )
@@ -1276,43 +1253,36 @@ def _emit_struct_impl(
             continue
         if category == "handle":
             lines.extend(
-                _borrow_handle_lines(field, source, member.type, registry, config)
+                _borrow_handle_lines(field, source, member.type, ir, config)
             )
             continue
         if category in {"enum", "bitmask"}:
             lines.append(
-                f"    {field} = static_cast<{_cpp_type(member.type, registry, config)}>({source});"
+                f"    {field} = static_cast<{_cpp_type(member.type, ir, config)}>({source});"
             )
         elif category == "struct":
             lines.append(
-                f"    {field}.from_cstruct({source}{_nested_from_arguments(member.type, registry, config, item)});"
+                f"    {field}.from_cstruct({source}{_nested_from_arguments(member.type, ir, config, struct)});"
             )
         else:
             lines.append(f"    {field} = {source};")
     lines.extend(["}"])
-
     output_lines = [
         f"inline void {name}::from_output_cstruct(const native_type& native) {{"
     ]
-    if not _struct_from_parent_types(item, registry) and not _struct_context_lengths(
-        item, registry
-    ):
+    if not _struct_from_parent_types(struct, ir) and not _struct_context_lengths(struct, ir):
         output_lines.append("    from_cstruct(native);")
     else:
-        # Output pNext records can contain input Vulkan handles (the Metal
-        # export structures are the current registry examples).  Preserve
-        # those owned wrappers; refresh only fields that do not need an
-        # external parent/context to reconstruct safely.
-        for member in item.members:
-            category = _type_category(member.type, registry)
+        for member in struct.members:
+            category = _type_category(member.type, ir)
             if member.name == "pNext" or member.name in counts or category == "handle":
                 continue
             source = f"native.{member.name}"
             field = field_names.get(member.name, member.name)
-            array_sizes = re.findall(r"\[([^\]]+)\]", member.declaration)
+            array_sizes = re.findall(r"\[([^\]]+)\]", member.c_suffix)
             if array_sizes:
                 if category in {"enum", "bitmask"}:
-                    cpp = _cpp_type(member.type, registry, config)
+                    cpp = _cpp_type(member.type, ir, config)
                     output_lines.append(
                         f"    for (std::size_t i = 0; i < {field}.size(); ++i) {field}[i] = static_cast<{cpp}>({source}[i]);"
                     )
@@ -1324,50 +1294,50 @@ def _emit_struct_impl(
                     output_lines.append(
                         f"    std::memcpy({field}.data(), {source}, sizeof({source}));"
                     )
-            elif member.pointer_depth or member.length:
-                # Dependency-bearing extension records are input-oriented
-                # except for scalar foreign output pointers.  Counted/nested
-                # data would require the missing conversion context and is
-                # therefore deliberately retained rather than shallow-copied.
-                if not member.length and member.pointer_depth == 0:
+            elif member.pointer_depth or _lengths(member):
+                if not _lengths(member) and member.pointer_depth == 0:
                     output_lines.append(f"    {field} = {source};")
                 elif (
-                    not member.length
+                    not _lengths(member)
                     and member.pointer_depth > 0
-                    and member.type not in registry.types
+                    and member.type not in ir.structs
+                    and member.type not in ir.handles
+                    and _type_category(member.type, ir) is None
                 ):
                     output_lines.append(f"    {field} = {source};")
             elif category in {"enum", "bitmask"}:
                 output_lines.append(
-                    f"    {field} = static_cast<{_cpp_type(member.type, registry, config)}>({source});"
+                    f"    {field} = static_cast<{_cpp_type(member.type, ir, config)}>({source});"
                 )
             elif category == "struct":
                 output_lines.append(f"    {field}.from_output_cstruct({source});")
             else:
                 output_lines.append(f"    {field} = {source};")
-    if "pNext" in {member.name for member in item.members}:
+    if "pNext" in {member.name for member in struct.members}:
         output_lines.append("    nextInChain.refresh();")
     output_lines.append("}")
     lines.extend(output_lines)
-    return _guard("\n".join(lines), item.protect or item.availability.protect)
+    return _guard("\n".join(lines), struct.protect or struct.availability.protect)
 
 
-def _emit_struct_implementations(registry: Registry, config: GeneratorConfig) -> str:
+def _emit_struct_implementations(ir: IrRegistry, config: GeneratorConfig) -> str:
     return "\n\n".join(
-        _emit_struct_impl(item, registry, config)
-        for item in registry.structs
-        if not item.alias and item.category == "struct"
+        _emit_struct_impl(struct, ir, config)
+        for struct in ir.structs.values()
+        if struct.category == "struct" and struct.active
     )
 
 
-def _emit_result_code(registry: Registry) -> str:
-    group = registry.enums.get("VkResult")
+def _emit_result_code(ir: IrRegistry) -> str:
+    group = ir.enums.get("Result")
     if group is None:
         return "enum class ResultCode : std::int32_t { Success = VK_SUCCESS };"
     lines = ["enum class ResultCode : std::int32_t {"]
     used: set[str] = set()
     for value in group.values:
-        name = enum_name(group.name, value.name, registry.tags)
+        if not value.active:
+            continue
+        name = enum_name(group.c_name, value.name, ir.tags)
         if name in used:
             continue
         used.add(name)
@@ -1381,95 +1351,94 @@ def _emit_result_code(registry: Registry) -> str:
     return "\n".join(lines)
 
 
-def _receiver_param(item: CommandAnalysis, receiver: str | None) -> Member | None:
+# ---------------------------------------------------------------------------
+# Command / handle helpers
+# ---------------------------------------------------------------------------
+
+def _receiver_param(command: Command, receiver: str | None) -> Param | None:
     if receiver is None:
         return None
     return next(
-        (p for p in item.command.params if p.type == receiver and p.pointer_depth == 0),
+        (p for p in command.params if p.type == receiver and p.pointer_depth == 0),
         None,
     )
 
 
 def _bound_handle_arguments(
-    item: CommandAnalysis, receiver: str | None, registry: Registry
+    command: Command, receiver: str | None, ir: IrRegistry
 ) -> dict[int, str]:
-    """Map receiver and retained ancestor parameters to native expressions."""
     if receiver is None:
         return {}
     expressions: dict[str, str] = {receiver: "raw()"}
-    current = registry.types.get(receiver)
+    current = _as_handle(ir, receiver)
     chain = ""
     visited: set[str] = set()
-    while current and current.parent:
-        parent_type = current.parent.split(",")[0]
+    while current and current.parents:
+        parent_type = current.parent
         if parent_type in visited:
             break
         visited.add(parent_type)
         chain += ".parent()"
         expressions.setdefault(parent_type, f"(*this){chain}.raw()")
-        current = registry.types.get(parent_type)
-    result: dict[int, str] = {}
-    for param in item.command.params:
-        if param.pointer_depth == 0 and param.type in expressions:
-            result[id(param)] = expressions[param.type]
-    return result
+        current = _as_handle(ir, parent_type)
+    return {
+        id(param): expressions[param.type]
+        for param in command.params
+        if param.pointer_depth == 0 and param.type in expressions
+    }
 
 
 def _bound_handle_wrapper_arguments(
-    item: CommandAnalysis, receiver: str, registry: Registry
+    command: Command, receiver: str, ir: IrRegistry
 ) -> dict[int, str]:
     expressions: dict[str, str] = {receiver: "*this"}
-    current = registry.types.get(receiver)
+    current = _as_handle(ir, receiver)
     expression = "this->parent()"
     visited: set[str] = set()
-    while current and current.parent:
-        parent_type = current.parent.split(",")[0]
+    while current and current.parents:
+        parent_type = current.parent
         if parent_type in visited:
             break
         visited.add(parent_type)
         expressions.setdefault(parent_type, expression)
         expression += ".parent()"
-        current = registry.types.get(parent_type)
+        current = _as_handle(ir, parent_type)
     return {
         id(param): expressions[param.type]
-        for param in item.command.params
+        for param in command.params
         if param.pointer_depth == 0 and param.type in expressions
     }
 
 
 def _externsync_lines(
-    item: CommandAnalysis,
+    command: Command,
     receiver: str | None,
-    registry: Registry,
+    ir: IrRegistry,
     result_type: str,
 ) -> list[str]:
     bound = (
-        _bound_handle_wrapper_arguments(item, receiver, registry) if receiver else {}
+        _bound_handle_wrapper_arguments(command, receiver, ir) if receiver else {}
     )
     targets: list[tuple[str, bool, bool]] = []
     dynamic_targets: list[tuple[str, str]] = []
-    for param in item.command.params:
+    for param in command.params:
         if not param.externsync:
             continue
-        if _type_category(param.type, registry) != "handle":
-            expression = param.externsync_expression or ""
+        if _type_category(param.type, ir) != "handle":
+            expression = param.externsync or ""
             nested_array = re.fullmatch(
                 r"(?:maybe:)?(p[A-Z]\w*)\[\]\.([A-Za-z_]\w*)", expression
             )
             nested_member = re.fullmatch(r"(p[A-Z]\w*)->([A-Za-z_]\w*)", expression)
-            struct = registry.types.get(param.type)
+            struct = _as_struct(ir, param.type)
             if nested_array and struct is not None:
                 member = next(
-                    (
-                        value
-                        for value in struct.members
-                        if value.name == nested_array.group(2)
-                    ),
+                    (value for value in struct.members if value.name == nested_array.group(2)),
                     None,
                 )
                 if (
                     member is not None
-                    and _type_category(member.type, registry) == "handle"
+                    and _type_category(member.type, ir) == "handle"
                 ):
                     field = _struct_member_names(struct).get(member.name, member.name)
                     targets.append(
@@ -1497,23 +1466,20 @@ def _externsync_lines(
         targets.append(
             (
                 expression,
-                bool(param.length) and not is_bound,
-                "true" in param.optional and not is_bound,
+                bool(_lengths(param)) and not is_bound,
+                param.is_optional and not is_bound,
             )
         )
 
-    # XML prose uses implicit synchronization for a small number of parent
-    # objects.  The child wrapper already knows that concrete parent, so no
-    # generic object registry is needed.
     parent_exclusive = (
-        bool(item.command.implicit_externsync)
+        bool(command.implicit_externsync)
         and receiver is not None
-        and any("commandPool" in text for text in item.command.implicit_externsync)
+        and any("commandPool" in text for text in command.implicit_externsync)
     )
     receiver_exclusive = (
-        bool(item.command.implicit_externsync)
-        and receiver == "VkDevice"
-        and any("VkQueue" in text for text in item.command.implicit_externsync)
+        bool(command.implicit_externsync)
+        and receiver == "Device"
+        and any("VkQueue" in text for text in command.implicit_externsync)
     )
     if (
         not targets
@@ -1553,10 +1519,12 @@ def _externsync_lines(
                 ]
             )
         elif is_optional:
+            # Optional by-value handles are plain handle refs (the wrapper's
+            # null state represents absence), so no dereference is needed.
             lines.extend(
                 [
                     f"if ({expression}) {{",
-                    f"    auto lock = detail::ExternsyncAccess::collect(*{expression}, true, externsync_states);",
+                    f"    auto lock = detail::ExternsyncAccess::collect({expression}, true, externsync_states);",
                     f"    if (!lock) {{ {failure} }}",
                     "}",
                 ]
@@ -1596,27 +1564,27 @@ def _externsync_lines(
     return lines
 
 
-def _is_device_scope(handle: TypeDecl, registry: Registry) -> bool:
-    current: TypeDecl | None = handle
+def _is_device_scope(handle: Handle, ir: IrRegistry) -> bool:
+    current: Handle | None = handle
     visited: set[str] = set()
     while current is not None and current.name not in visited:
-        if current.name == "VkDevice":
+        if current.c_name == "VkDevice":
             return True
         visited.add(current.name)
-        parent = current.parent.split(",")[0] if current.parent else None
-        current = registry.types.get(parent) if parent else None
+        parent = current.parent
+        current = _as_handle(ir, parent) if parent else None
     return False
 
 
 def _dispatch_call(
-    command: Command, receiver: str | None, registry: Registry, arguments: list[str]
+    command: Command, receiver: str | None, ir: IrRegistry, arguments: list[str]
 ) -> str:
     if receiver is None:
-        return f"::{command.name}({', '.join(arguments)})"
-    if command.name == "vkGetInstanceProcAddr":
+        return f"::{command.c_name}({', '.join(arguments)})"
+    if command.c_name == "vkGetInstanceProcAddr":
         return f"::vkGetInstanceProcAddr({', '.join(arguments)})"
     dispatch_type = command.params[0].type if command.params else None
-    dispatch_decl = registry.types.get(dispatch_type) if dispatch_type else None
+    dispatch_handle = _as_handle(ir, dispatch_type) if dispatch_type else None
     instance_loaded_device_commands = {
         "vkSetDebugUtilsObjectNameEXT",
         "vkSetDebugUtilsObjectTagEXT",
@@ -1629,53 +1597,52 @@ def _dispatch_call(
     }
     table = (
         "instance"
-        if command.name == "vkGetDeviceProcAddr"
-        or command.name in instance_loaded_device_commands
-        or dispatch_decl is None
-        or not _is_device_scope(dispatch_decl, registry)
+        if command.c_name == "vkGetDeviceProcAddr"
+        or command.c_name in instance_loaded_device_commands
+        or dispatch_handle is None
+        or not _is_device_scope(dispatch_handle, ir)
         else "device"
     )
     if table == "device":
-        function = f'(this->dispatchState().device ? this->dispatchState().device->{command.name} : reinterpret_cast<PFN_{command.name}>(this->dispatchState().instance->vkGetDeviceProcAddr(this->dispatchState().native_device, "{command.name}")))'
+        function = f'(this->dispatchState().device ? this->dispatchState().device->{command.c_name} : reinterpret_cast<PFN_{command.c_name}>(this->dispatchState().instance->vkGetDeviceProcAddr(this->dispatchState().native_device, "{command.c_name}")))'
     else:
-        function = f"(this->dispatchState().instance ? this->dispatchState().instance->{command.name} : ::{command.name})"
+        function = f"(this->dispatchState().instance ? this->dispatchState().instance->{command.c_name} : ::{command.c_name})"
     return f"{function}({', '.join(arguments)})"
 
 
 def _output_handle_parent_expression(
     handle_type: str,
     receiver: str | None,
-    command_params: list[Member],
-    bound: Member | None,
-    registry: Registry,
+    command_params: tuple[Param, ...],
+    bound: Param | None,
+    ir: IrRegistry,
 ) -> str | None:
-    handle = registry.types.get(handle_type)
-    parent_type = handle.parent.split(",")[0] if handle and handle.parent else None
+    handle = _as_handle(ir, handle_type)
+    parent_type = handle.parent if handle else None
     if parent_type is None:
         return None
     if receiver == parent_type:
         return "*this"
     if receiver:
-        current = registry.types.get(receiver)
+        current = _as_handle(ir, receiver)
         expression = "this->parent()"
-        while current and current.parent:
-            current_parent = current.parent.split(",")[0]
+        while current and current.parents:
+            current_parent = current.parent
             if current_parent == parent_type:
                 return expression
             expression += ".parent()"
-            current = registry.types.get(current_parent)
+            current = _as_handle(ir, current_parent)
     for param in command_params:
         if (
             param is not bound
             and param.type == parent_type
             and param.pointer_depth == 0
         ):
-            name = _public_param_name(param)
-            return f"*{name}" if "true" in param.optional else name
+            return _public_param_name(param)
     for param in command_params:
         if param is bound:
             continue
-        struct = registry.types.get(param.type)
+        struct = _as_struct(ir, param.type)
         if not struct or struct.category != "struct":
             continue
         member = next(
@@ -1690,7 +1657,7 @@ def _output_handle_parent_expression(
             continue
         struct_name = _public_param_name(param)
         field_name = _struct_member_names(struct).get(member.name, member.name)
-        if param.pointer_depth and "true" in param.optional:
+        if param.pointer_depth and param.is_optional:
             return f"{struct_name}->get().{field_name}"
         return f"{struct_name}.{field_name}"
     return None
@@ -1699,9 +1666,9 @@ def _output_handle_parent_expression(
 def _wrapper_expression_for_type(
     type_name: str,
     receiver: str | None,
-    command_params: list[Member],
-    bound: Member | None,
-    registry: Registry,
+    command_params: tuple[Param, ...],
+    bound: Param | None,
+    ir: IrRegistry,
 ) -> str | None:
     if receiver:
         current_type = receiver
@@ -1709,10 +1676,10 @@ def _wrapper_expression_for_type(
         while True:
             if current_type == type_name:
                 return expression
-            current = registry.types.get(current_type)
-            if current is None or not current.parent:
+            current = _as_handle(ir, current_type)
+            if current is None or not current.parents:
                 break
-            current_type = current.parent.split(",")[0]
+            current_type = current.parent
             expression = (
                 "this->parent()" if expression == "*this" else expression + ".parent()"
             )
@@ -1724,16 +1691,16 @@ def _wrapper_expression_for_type(
     for param in command_params:
         if param is bound:
             continue
-        struct = registry.types.get(param.type)
+        struct = _as_struct(ir, param.type)
         if struct is None or struct.category != "struct":
             continue
         struct_expression = _public_param_name(param)
-        if param.pointer_depth and "true" in param.optional:
+        if param.pointer_depth and param.is_optional:
             struct_expression += "->get()"
         for member in struct.members:
             if (
                 member.pointer_depth != 0
-                or _type_category(member.type, registry) != "handle"
+                or _type_category(member.type, ir) != "handle"
             ):
                 continue
             expression = f"{struct_expression}.{_struct_member_names(struct).get(member.name, member.name)}"
@@ -1741,10 +1708,10 @@ def _wrapper_expression_for_type(
             while True:
                 if current_type == type_name:
                     return expression
-                current = registry.types.get(current_type)
-                if current is None or not current.parent:
+                current = _as_handle(ir, current_type)
+                if current is None or not current.parents:
                     break
-                current_type = current.parent.split(",")[0]
+                current_type = current.parent
                 expression += ".parent()"
     return None
 
@@ -1752,50 +1719,72 @@ def _wrapper_expression_for_type(
 def _command_struct_from_arguments(
     type_name: str,
     receiver: str | None,
-    item: CommandAnalysis,
-    bound: Member | None,
-    registry: Registry,
+    command: Command,
+    bound: Param | None,
+    ir: IrRegistry,
     config: GeneratorConfig,
 ) -> str:
-    struct = registry.types.get(type_name)
+    struct = _as_struct(ir, type_name)
     if not struct:
         return ""
     arguments: list[str] = []
-    for parent in _struct_from_parent_types(struct, registry):
+    for parent in _struct_from_parent_types(struct, ir):
         expression = _wrapper_expression_for_type(
-            parent, receiver, item.command.params, bound, registry
+            parent, receiver, command.params, bound, ir
         )
         if expression is None:
             raise ValueError(
-                f"cannot infer {parent} needed to convert {type_name} returned by {item.command.name}"
+                f"cannot infer {parent} needed to convert {type_name} returned by {command.c_name}"
             )
         arguments.append(expression)
     return "".join(f", {argument}" for argument in arguments)
 
 
+def _release_target(command: Command, ir: IrRegistry) -> Param | None:
+    if not command.c_name.startswith(("vkDestroy", "vkFree", "vkRelease")):
+        return None
+    handle_names = ir.handle_names
+    handles = [param for param in command.params if param.type in handle_names]
+    pointer_targets = [param for param in handles if param.pointer_depth]
+    if pointer_targets:
+        return pointer_targets[-1] if len(pointer_targets) == 1 else None
+    if command.c_name.startswith("vkDestroy"):
+        return handles[-1] if handles else None
+    if command.c_name.startswith("vkFree"):
+        return handles[-1] if len(handles) >= 2 else None
+    return handles[-1] if len(handles) >= 2 else None
+
+
+def _is_owned_handle_output(command: Command, param: Param) -> bool:
+    return param.name in command.owned_outputs
+
+
+def _releaser_command(handle_general: str, ir: IrRegistry) -> Command | None:
+    handle = _as_handle(ir, handle_general)
+    if handle is None or handle.releaser is None:
+        return None
+    return ir.commands.get(handle.releaser)
+
+
 def _handle_release_lambda(
-    output: Member,
+    output: Param,
     producer: Command,
     release: Command,
     receiver: str | None,
-    bound: Member | None,
-    registry: Registry,
+    bound: Param | None,
+    ir: IrRegistry,
     config: GeneratorConfig,
 ) -> str | None:
-    handle_types = {handle.name for handle in registry.handles}
-    target = release_target(release, handle_types)
+    handle_names = ir.handle_names
+    target = _release_target(release, ir)
     if target is None or target.type != output.type:
         return None
     captures: list[str] = []
     arguments: list[str] = []
     setup: list[str] = []
     used_captures: set[str] = set()
-    output_handle = registry.types.get(output.type)
-    immediate_parent = (
-        output_handle.parent.split(",")[0]
-        if output_handle and output_handle.parent
-        else None
-    )
+    output_handle = _as_handle(ir, output.type)
+    immediate_parent = output_handle.parent if output_handle else None
 
     def parent_expression(type_name: str) -> str | None:
         if immediate_parent is None:
@@ -1805,17 +1794,17 @@ def _handle_release_lambda(
         while True:
             if current_type == type_name:
                 return expression
-            current = registry.types.get(current_type)
-            if current is None or not current.parent:
+            current = _as_handle(ir, current_type)
+            if current is None or not current.parents:
                 return None
-            current_type = current.parent.split(",")[0]
+            current_type = current.parent
             expression += ".parent()"
 
     for param in release.params:
         if param is target:
             arguments.append("&value" if param.pointer_depth else "value")
             continue
-        if param.type == "VkAllocationCallbacks" and param.pointer_depth == 1:
+        if param.type == "AllocationCallbacks" and param.pointer_depth == 1:
             allocator_param = next(
                 (
                     candidate
@@ -1830,21 +1819,21 @@ def _handle_release_lambda(
             public = _public_param_name(allocator_param)
             capture = "release_allocator"
             captures.append(
-                f"{capture} = {public} ? std::optional<{_cpp_type(param.type, registry, config)}>({public}->get()) : std::nullopt"
+                f"{capture} = {public} ? std::optional<{_cpp_type(param.type, ir, config)}>({public}->get()) : std::nullopt"
             )
             setup.extend(
                 [
-                    f"{_cpp_type(param.type, registry, config)}::CStruct allocator_native{{}};",
+                    f"{_cpp_type(param.type, ir, config)}::CStruct allocator_native{{}};",
                     f"if ({capture}) {capture}->to_cstruct(&allocator_native);",
                 ]
             )
             arguments.append(f"{capture} ? &allocator_native.value : nullptr")
             continue
-        if param.type in handle_types:
+        if param.type in handle_names:
             expression = parent_expression(param.type)
             if expression is None and immediate_parent is None:
                 expression = _wrapper_expression_for_type(
-                    param.type, receiver, producer.params, bound, registry
+                    param.type, receiver, producer.params, bound, ir
                 )
             if expression is None:
                 return None
@@ -1858,28 +1847,27 @@ def _handle_release_lambda(
                 arguments.append(f"{capture}.raw()")
             continue
         if param.pointer_depth == 0 and any(
-            param.name in length for length in target.length
+            param.name in length for length in _lengths(target)
         ):
-            arguments.append(f"static_cast<{param.type}>(1)")
+            arguments.append(f"static_cast<{param.c_type}>(1)")
             continue
-        # Array free counts refer to the released target even though the target
-        # XML length points in the opposite direction.
         if (
             param.pointer_depth == 0
             and param.name.lower().endswith("count")
             and target.pointer_depth
         ):
-            arguments.append(f"static_cast<{param.type}>(1)")
+            arguments.append(f"static_cast<{param.c_type}>(1)")
             continue
         return None
     dispatch_handle = next(
-        (param for param in release.params if param.type in handle_types), None
+        (param for param in release.params if param.type in handle_names), None
     )
     dispatch_prefix: str | None = None
     if dispatch_handle is not None:
+        dispatch = _as_handle(ir, dispatch_handle.type)
         table = (
             "device"
-            if _is_device_scope(registry.types[dispatch_handle.type], registry)
+            if dispatch is not None and _is_device_scope(dispatch, ir)
             else "instance"
         )
         if dispatch_handle is target:
@@ -1893,21 +1881,21 @@ def _handle_release_lambda(
                     f"{loader}(&release_table, value);",
                 ]
             )
-            call = f"release_table.{release.name}({', '.join(arguments)})"
-        elif dispatch_handle is not target:
+            call = f"release_table.{release.c_name}({', '.join(arguments)})"
+        else:
             dispatch_prefix = (
                 parent_expression(dispatch_handle.type)
                 if immediate_parent is not None
                 else "release_" + _public_param_name(dispatch_handle)
             )
         if dispatch_handle is not target and dispatch_prefix:
-            call = f"({dispatch_prefix}.dispatchState().{table} ? {dispatch_prefix}.dispatchState().{table}->{release.name} : ::{release.name})({', '.join(arguments)})"
+            call = f"({dispatch_prefix}.dispatchState().{table} ? {dispatch_prefix}.dispatchState().{table}->{release.c_name} : ::{release.c_name})({', '.join(arguments)})"
         elif dispatch_handle is not target:
-            call = f"::{release.name}({', '.join(arguments)})"
+            call = f"::{release.c_name}({', '.join(arguments)})"
     else:
-        call = f"::{release.name}({', '.join(arguments)})"
+        call = f"::{release.c_name}({', '.join(arguments)})"
     body = ["try {", *(f"    {line}" for line in setup)]
-    if release.return_type == "VkResult":
+    if release.c_return_type == "VkResult":
         body.extend(
             [
                 f"    auto status = static_cast<ResultCode>({call});",
@@ -1926,33 +1914,26 @@ def _handle_release_lambda(
     capture_list = ", ".join(captures)
     indented = " ".join(body)
     owner_parameter = (
-        f"const {_cpp_type(immediate_parent, registry, config)}& owner, "
+        f"const {_cpp_type(immediate_parent, ir, config)}& owner, "
         if immediate_parent is not None
         else ""
     )
-    return f"[{capture_list}]({owner_parameter}{output.type} value) noexcept {{ {indented} }}"
+    return f"[{capture_list}]({owner_parameter}{output.c_type} value) noexcept {{ {indented} }}"
 
 
 def _handle_ownership_condition(
-    output: Member,
+    output: Param,
     producer: Command,
-    registry: Registry,
+    ir: IrRegistry,
     config: GeneratorConfig,
 ) -> str | None:
-    """Return a runtime condition for handles whose individual release is optional.
-
-    Descriptor sets are pool-owned unless the pool was explicitly created with
-    FREE_DESCRIPTOR_SET.  Treat a pool with no retained creation record as the
-    conservative pool-owned case; destroying the retained pool still releases
-    the native sets safely.
-    """
-    if output.type != "VkDescriptorSet" or producer.name != "vkAllocateDescriptorSets":
+    if output.type != "DescriptorSet" or producer.c_name != "vkAllocateDescriptorSets":
         return None
     allocate_info = next(
         (
             param
             for param in producer.params
-            if param.type == "VkDescriptorSetAllocateInfo"
+            if param.type == "DescriptorSetAllocateInfo"
         ),
         None,
     )
@@ -1967,19 +1948,17 @@ def _handle_ownership_condition(
 
 
 def _creation_record_expression(
-    output: Member,
+    output: Param,
     command: Command,
     index: str | None,
-    registry: Registry,
+    ir: IrRegistry,
     config: GeneratorConfig,
 ) -> str | None:
-    handle = registry.types.get(output.type)
-    if handle is None:
+    handle = _as_handle(ir, output.type)
+    if handle is None or not handle.create_info:
         return None
-    record_type = creation_info_for_handle(registry, handle)
-    create_infos = creation_infos_for_handle(registry, handle)
-    if record_type is None:
-        return None
+    record_type = handle.create_info
+    create_infos = set(handle.create_infos)
     source = next(
         (
             param
@@ -1991,64 +1970,68 @@ def _creation_record_expression(
     if source is None:
         return None
     expression = _public_param_name(source)
-    if source.length and index is not None:
+    if _lengths(source) and index is not None:
         expression += f"[{index}]"
-    elif "true" in source.optional:
+    elif source.is_optional:
         return None
-    cpp = _cpp_type(record_type, registry, config)
-    return f"std::make_shared<const {cpp}>({expression})"
+    record_cpp = _cpp_type(record_type, ir, config)
+    return f"std::make_shared<const {record_cpp}>({expression})"
+
+
+def _command_result_name(command: Command) -> str:
+    return command.cpp_name[:1].upper() + command.cpp_name[1:] + "Result"
 
 
 def _command_parts(
-    item: CommandAnalysis,
+    command: Command,
     receiver: str | None,
-    registry: Registry,
+    ir: IrRegistry,
     config: GeneratorConfig,
-    value_output: Member | tuple[Member, ...] | None = None,
+    value_output: Param | tuple[Param, ...] | None = None,
 ) -> tuple[str, str, str]:
-    bound = _receiver_param(item, receiver) if receiver else None
+    bound = _receiver_param(command, receiver) if receiver else None
     bound_arguments = (
-        _bound_handle_arguments(item, receiver, registry) if receiver else {}
+        _bound_handle_arguments(command, receiver, ir) if receiver else {}
     )
-    span_lengths: dict[str, Member] = {}
-    for param in item.command.params:
+    span_lengths: dict[str, Param] = {}
+    for param in command.params:
         if (
             param.const
-            and param.length
-            and "null-terminated" not in param.length
+            and _lengths(param)
+            and "null-terminated" not in _lengths(param)
             and param.type != "void"
         ):
-            for length in param.length:
+            for length in _lengths(param):
                 if re.fullmatch(r"[A-Za-z_]\w*", length):
                     span_lengths.setdefault(length, param)
 
     value_outputs = (
-        (value_output,) if isinstance(value_output, Member) else value_output
+        (value_output,) if isinstance(value_output, Param) else value_output
     ) or ()
     value_output_ids = {id(param) for param in value_outputs}
     visible = [
         param
-        for param in item.command.params
+        for param in command.params
         if id(param) not in bound_arguments
         and param.name not in span_lengths
         and id(param) not in value_output_ids
     ]
     params = ", ".join(
-        f"{_public_param_type(param, registry, config)} {_public_param_name(param)}"
+        f"{_public_param_type(param, ir, config)} {_public_param_name(param)}"
         for param in visible
     )
     value_type = None
     status_value_result = False
     if value_outputs:
         if len(value_outputs) == 1:
-            cpp = _cpp_type(value_outputs[0].type, registry, config)
-            value_type = f"std::vector<{cpp}>" if value_outputs[0].length else cpp
+            cpp = _cpp_type(value_outputs[0].type, ir, config)
+            value_type = f"std::vector<{cpp}>" if _lengths(value_outputs[0]) else cpp
         else:
-            value_type = _command_result_name(item)
+            value_type = _command_result_name(command)
         status_value_result = (
-            item.command.return_type == "VkResult" and item.output.status_value
+            command.c_return_type == "VkResult" and command.status_alternatives
         )
-        if item.command.return_type == "VkResult":
+        if command.c_return_type == "VkResult":
             result = (
                 f"ResultValue<{value_type}>"
                 if status_value_result
@@ -2059,11 +2042,11 @@ def _command_parts(
     else:
         result = (
             "void"
-            if item.command.return_type == "void"
+            if command.c_return_type == "void"
             else (
                 "Result<void>"
-                if item.command.return_type == "VkResult"
-                else _cpp_type(item.command.return_type, registry, config)
+                if command.c_return_type == "VkResult"
+                else _cpp_type(command.return_type, ir, config)
             )
         )
 
@@ -2071,23 +2054,21 @@ def _command_parts(
     postlude: list[str] = []
     failure_cleanup: list[str] = []
     arguments: list[str] = []
-    wrap_failures: list[str] = []
-    releasers = handle_releasers(registry, {handle.name for handle in registry.handles})
-    prelude.extend(_externsync_lines(item, receiver, registry, result))
+    prelude.extend(_externsync_lines(command, receiver, ir, result))
     value_locals: dict[int, str] = {}
     if value_outputs:
         if len(value_outputs) > 1:
             prelude.append(f"{value_type} value{{}};")
         for output in value_outputs:
-            cpp = _cpp_type(output.type, registry, config)
+            cpp = _cpp_type(output.type, ir, config)
             local = (
                 "value"
                 if len(value_outputs) == 1
                 else f"result_{_public_param_name(output)}"
             )
             value_locals[id(output)] = local
-            if output.length:
-                size = _output_size_expression(output, item.command, registry)
+            if _lengths(output):
+                size = _output_size_expression(output, command, ir)
                 if size is None:
                     return result, params, ""
                 if len(value_outputs) == 1:
@@ -2103,32 +2084,30 @@ def _command_parts(
             else:
                 prelude.append(f"{cpp} {local}{{}};")
 
-    def double_pointer_partition(param: Member) -> tuple[str, str] | None:
-        """Find the sibling struct span whose native count partitions a flat T** span."""
-        # `len="count,1"` is an array of pointers to individual T values, not
-        # a jagged array.  Its public representation is still a flat span, but
-        # native lowering must emit one pointer for every span element.
-        if any(length == "1" for length in param.length[1:]):
+    def double_pointer_partition(param: Param) -> tuple[str, str] | None:
+        if any(length == "1" for length in _lengths(param)[1:]):
             return None
         outer_lengths = {
-            length for length in param.length if re.fullmatch(r"[A-Za-z_]\w*", length)
+            length
+            for length in _lengths(param)
+            if re.fullmatch(r"[A-Za-z_]\w*", length)
         }
-        for candidate in item.command.params:
+        for candidate in command.params:
             if (
                 candidate is param
                 or not candidate.const
                 or candidate.pointer_depth != 1
             ):
                 continue
-            if not outer_lengths.intersection(candidate.length):
+            if not outer_lengths.intersection(_lengths(candidate)):
                 continue
-            candidate_type = registry.types.get(candidate.type)
-            if candidate_type is None or candidate_type.category != "struct":
+            candidate_struct = _as_struct(ir, candidate.type)
+            if candidate_struct is None or candidate_struct.category != "struct":
                 continue
             count_member = next(
                 (
                     member
-                    for member in candidate_type.members
+                    for member in candidate_struct.members
                     if member.pointer_depth == 0 and member.name.endswith("Count")
                 ),
                 None,
@@ -2138,13 +2117,10 @@ def _command_parts(
         return None
 
     def safe_span_count(count_name: str) -> str:
-        sources: list[tuple[Member, str]] = []
-        for candidate in item.command.params:
-            if count_name not in candidate.length or not candidate.pointer_depth:
+        sources: list[tuple[Param, str]] = []
+        for candidate in command.params:
+            if count_name not in _lengths(candidate) or not candidate.pointer_depth:
                 continue
-            # A genuine per-element secondary length is represented by one
-            # flat public span and lowered separately into pointer partitions;
-            # its total element count is not the outer Vulkan count.
             if (
                 candidate.pointer_depth > 1
                 and double_pointer_partition(candidate) is not None
@@ -2160,14 +2136,12 @@ def _command_parts(
         required = [
             expression
             for candidate, expression in sources
-            if not (candidate.optional and candidate.optional[0] == "true")
-            and not candidate.no_auto_validity
+            if not candidate.is_optional and not candidate.no_auto_validity
         ]
         conditional = [
             expression
             for candidate, expression in sources
-            if (candidate.optional and candidate.optional[0] == "true")
-            or candidate.no_auto_validity
+            if candidate.is_optional or candidate.no_auto_validity
         ]
         if required:
             initial, *remaining = required
@@ -2188,18 +2162,18 @@ def _command_parts(
             "if (candidate != 0 && (capacity == 0 || candidate < capacity)) capacity = candidate; return capacity; }()"
         )
 
-    for param in item.command.params:
+    for param in command.params:
         is_value_output = id(param) in value_output_ids
         public = (
             value_locals[id(param)] if is_value_output else _public_param_name(param)
         )
-        category = _type_category(param.type, registry)
+        category = _type_category(param.type, ir)
         if id(param) in bound_arguments:
             arguments.append(bound_arguments[id(param)])
             continue
         if param.name in span_lengths:
             arguments.append(
-                f"static_cast<{param.type}>({safe_span_count(param.name)})"
+                f"static_cast<{param.c_type}>({safe_span_count(param.name)})"
             )
             continue
 
@@ -2207,9 +2181,9 @@ def _command_parts(
             param.const
             and param.type == "char"
             and param.pointer_depth == 1
-            and "null-terminated" in param.length
+            and "null-terminated" in _lengths(param)
         ):
-            if "true" in param.optional:
+            if param.is_optional:
                 prelude.append(
                     f"std::optional<std::string> {public}_native = {public} ? std::optional<std::string>(std::in_place, *{public}) : std::nullopt;"
                 )
@@ -2222,28 +2196,28 @@ def _command_parts(
             continue
 
         is_span = (
-            bool(param.length) and "null-terminated" not in param.length
-        ) or "[" in param.declaration
+            bool(_lengths(param)) and "null-terminated" not in _lengths(param)
+        ) or "[" in param.c_suffix
         if is_span:
             if param.type == "void":
                 arguments.append(
                     f"reinterpret_cast<{'const ' if param.const else ''}void*>({public}.empty() ? nullptr : {public}.data())"
                 )
             elif category == "struct":
-                cpp = _cpp_type(param.type, registry, config)
+                cpp = _cpp_type(param.type, ir, config)
                 if param.pointer_depth > 1:
                     partition = double_pointer_partition(param)
                     prelude.extend(
                         [
                             f"std::vector<{cpp}::CStruct> {public}_cache({public}.size());",
-                            f"std::vector<{param.type}> {public}_native({public}.size());",
+                            f"std::vector<{param.c_type}> {public}_native({public}.size());",
                             f"for (std::size_t i = 0; i < {public}.size(); ++i) {{ {public}[i].to_cstruct(&{public}_cache[i]); {public}_native[i] = {public}_cache[i].value; }}",
                         ]
                     )
                     if partition is None:
                         prelude.extend(
                             [
-                                f"std::vector<const {param.type}*> {public}_pointers({public}_native.size());",
+                                f"std::vector<const {param.c_type}*> {public}_pointers({public}_native.size());",
                                 f"for (std::size_t i = 0; i < {public}_native.size(); ++i) {public}_pointers[i] = &{public}_native[i];",
                             ]
                         )
@@ -2254,8 +2228,7 @@ def _command_parts(
                             if status_value_result
                             else (
                                 "return std::unexpected(ResultCode::ErrorUnknown);"
-                                if value_outputs
-                                and item.command.return_type == "VkResult"
+                                if value_outputs and command.c_return_type == "VkResult"
                                 else (
                                     "return std::unexpected(ResultCode::ErrorUnknown);"
                                     if result == "Result<void>"
@@ -2268,7 +2241,7 @@ def _command_parts(
                                 f"std::size_t {public}_required = 0;",
                                 f"for (const auto& info : {partition_source}_native) {public}_required += info.{partition_count};",
                                 f"if ({public}.size() != {public}_required) {{ {invalid_return} }}",
-                                f"std::vector<const {param.type}*> {public}_pointers({partition_source}_native.size());",
+                                f"std::vector<const {param.c_type}*> {public}_pointers({partition_source}_native.size());",
                                 f"std::size_t {public}_offset = 0;",
                                 f"for (std::size_t i = 0; i < {partition_source}_native.size(); ++i) {{",
                                 f"    const auto segment_size = static_cast<std::size_t>({partition_source}_native[i].{partition_count});",
@@ -2284,7 +2257,7 @@ def _command_parts(
                     prelude.extend(
                         [
                             f"std::vector<{cpp}::CStruct> {public}_cache({public}.size());",
-                            f"std::vector<{param.type}> {public}_native({public}.size());",
+                            f"std::vector<{param.c_type}> {public}_native({public}.size());",
                         ]
                     )
                     if param.const:
@@ -2296,61 +2269,49 @@ def _command_parts(
                             f"for (std::size_t i = 0; i < {public}.size(); ++i) {{ {public}[i].to_cstruct(&{public}_cache[i]); {public}_native[i] = {public}_cache[i].value; }}"
                         )
                         from_args = _command_struct_from_arguments(
-                            param.type, receiver, item, bound, registry, config
+                            param.type, receiver, command, bound, ir, config
                         )
                         postlude.append(
-                            f"for (std::size_t i = 0; i < {public}.size(); ++i) {{ {public}[i].from_cstruct({public}_native[i]{from_args});{_output_chain_refresh(param.type, f'{public}[i]', registry)} }}"
+                            f"for (std::size_t i = 0; i < {public}.size(); ++i) {{ {public}[i].from_cstruct({public}_native[i]{from_args});{_output_chain_refresh(param.type, f'{public}[i]', ir)} }}"
                         )
                     arguments.append(
                         f"{public}_native.empty() ? nullptr : {public}_native.data()"
                     )
             elif category == "handle":
                 prelude.append(
-                    f"std::vector<{param.type}> {public}_native({public}.size());"
+                    f"std::vector<{param.c_type}> {public}_native({public}.size());"
                 )
                 if param.const:
                     prelude.append(
                         f"for (std::size_t i = 0; i < {public}.size(); ++i) {public}_native[i] = {public}[i].raw();"
                     )
                 else:
-                    cpp = _cpp_type(param.type, registry, config)
+                    cpp = _cpp_type(param.type, ir, config)
                     parent = _output_handle_parent_expression(
-                        param.type, receiver, item.command.params, bound, registry
+                        param.type, receiver, command.params, bound, ir
                     )
-                    release = releasers.get(param.type)
-                    owned = release is not None and is_owned_handle_output(
-                        item.command, param, releasers
-                    )
+                    release = _releaser_command(param.type, ir)
+                    owned = release is not None and _is_owned_handle_output(command, param)
                     ownership_condition = (
-                        _handle_ownership_condition(
-                            param, item.command, registry, config
-                        )
+                        _handle_ownership_condition(param, command, ir, config)
                         if owned
                         else None
                     )
                     destroyer = (
                         _handle_release_lambda(
-                            param,
-                            item.command,
-                            release,
-                            receiver,
-                            bound,
-                            registry,
-                            config,
+                            param, command, release, receiver, bound, ir, config
                         )
                         if owned and release is not None
                         else None
                     )
                     record = (
-                        _creation_record_expression(
-                            param, item.command, "i", registry, config
-                        )
+                        _creation_record_expression(param, command, "i", ir, config)
                         if owned
                         else None
                     )
                     if owned and destroyer is None:
                         raise ValueError(
-                            f"cannot infer release provenance for {item.command.name}.{param.name}"
+                            f"cannot infer release provenance for {command.c_name}.{param.name}"
                         )
                     if owned:
                         cleanup_call = (
@@ -2360,7 +2321,7 @@ def _command_parts(
                         )
                         cleanup_lines = [
                             f"auto {public}_cleanup = {destroyer};",
-                            f"for (auto native : {public}_native) if (native != {param.type}{{}}) {cleanup_call};",
+                            f"for (auto native : {public}_native) if (native != {param.c_type}{{}}) {cleanup_call};",
                         ]
                         if ownership_condition:
                             failure_cleanup.extend(
@@ -2381,9 +2342,7 @@ def _command_parts(
                         if parent:
                             adopt_wrap += f", {parent}"
                         adopt_wrap += f", {destroyer}"
-                        if creation_info_for_handle(
-                            registry, registry.types[param.type]
-                        ):
+                        if ir.handles[param.type].create_info:
                             adopt_wrap += f", {record or '{}'}"
                         adopt_wrap += ")"
                         wrap = (
@@ -2398,7 +2357,7 @@ def _command_parts(
                         if status_value_result
                         else (
                             "return std::unexpected(wrapped.error());"
-                            if value_outputs and item.command.return_type == "VkResult"
+                            if value_outputs and command.c_return_type == "VkResult"
                             else (
                                 "return std::unexpected(wrapped.error());"
                                 if result == "Result<void>"
@@ -2412,26 +2371,26 @@ def _command_parts(
                             if parent
                             else f"cleanup({public}_native[remaining])"
                         )
-                        cleanup_remainder = f"auto cleanup = {destroyer}; for (std::size_t remaining = i + 1; remaining < {public}_native.size(); ++remaining) if ({public}_native[remaining] != {param.type}{{}}) {cleanup_call};"
+                        cleanup_remainder = f"auto cleanup = {destroyer}; for (std::size_t remaining = i + 1; remaining < {public}_native.size(); ++remaining) if ({public}_native[remaining] != {param.c_type}{{}}) {cleanup_call};"
                         if ownership_condition:
                             cleanup_remainder = (
                                 f"if ({ownership_condition}) {{ {cleanup_remainder} }}"
                             )
                         failure = cleanup_remainder + " " + failure
                     postlude.append(
-                        f"for (std::size_t i = 0; i < {public}.size(); ++i) {{ if ({public}_native[i] == {param.type}{{}}) {{ {public}[i].reset(); continue; }} auto wrapped = {wrap}; if (!wrapped) {{ {failure} }} {public}[i] = std::move(*wrapped); }}"
+                        f"for (std::size_t i = 0; i < {public}.size(); ++i) {{ if ({public}_native[i] == {param.c_type}{{}}) {{ {public}[i].reset(); continue; }} auto wrapped = {wrap}; if (!wrapped) {{ {failure} }} {public}[i] = std::move(*wrapped); }}"
                     )
                 arguments.append(
                     f"{public}_native.empty() ? nullptr : {public}_native.data()"
                 )
             elif category in {"enum", "bitmask"}:
-                cpp = _cpp_type(param.type, registry, config)
+                cpp = _cpp_type(param.type, ir, config)
                 prelude.append(
-                    f"std::vector<{param.type}> {public}_native({public}.size());"
+                    f"std::vector<{param.c_type}> {public}_native({public}.size());"
                 )
                 if param.const:
                     prelude.append(
-                        f"for (std::size_t i = 0; i < {public}.size(); ++i) {public}_native[i] = {_native_value(param.type, f'{public}[i]', registry)};"
+                        f"for (std::size_t i = 0; i < {public}.size(); ++i) {public}_native[i] = {_native_value(param.type, f'{public}[i]', ir)};"
                     )
                 else:
                     postlude.append(
@@ -2446,7 +2405,7 @@ def _command_parts(
                     if partition is None:
                         prelude.extend(
                             [
-                                f"std::vector<const {param.type}*> {public}_pointers({public}.size());",
+                                f"std::vector<const {param.c_type}*> {public}_pointers({public}.size());",
                                 f"for (std::size_t i = 0; i < {public}.size(); ++i) {public}_pointers[i] = &{public}[i];",
                             ]
                         )
@@ -2462,7 +2421,7 @@ def _command_parts(
                                 f"std::size_t {public}_required = 0;",
                                 f"for (const auto& info : {partition_source}_native) {public}_required += info.{partition_count};",
                                 f"if ({public}.size() != {public}_required) {{ {invalid_return} }}",
-                                f"std::vector<const {param.type}*> {public}_pointers({partition_source}_native.size());",
+                                f"std::vector<const {param.c_type}*> {public}_pointers({partition_source}_native.size());",
                                 f"std::size_t {public}_offset = 0;",
                                 f"for (std::size_t i = 0; i < {partition_source}_native.size(); ++i) {{",
                                 f"    const auto segment_size = static_cast<std::size_t>({partition_source}_native[i].{partition_count});",
@@ -2480,22 +2439,18 @@ def _command_parts(
 
         if param.pointer_depth == 0:
             if category == "handle":
-                arguments.append(
-                    f"{public} ? {public}->raw() : {param.type}{{}}"
-                    if "true" in param.optional
-                    else f"{public}.raw()"
-                )
+                arguments.append(f"{public}.raw()")
             elif category in {"enum", "bitmask"}:
-                arguments.append(_native_value(param.type, public, registry))
+                arguments.append(_native_value(param.type, public, ir))
             else:
                 arguments.append(public)
             continue
 
         if param.pointer_depth == 1 and category == "struct":
-            cpp = _cpp_type(param.type, registry, config)
+            cpp = _cpp_type(param.type, ir, config)
             prelude.append(f"{cpp}::CStruct {public}_native{{}};")
             if param.const:
-                if "true" in param.optional:
+                if param.is_optional:
                     prelude.append(
                         f"if ({public}) {public}->get().to_cstruct(&{public}_native);"
                     )
@@ -2508,10 +2463,10 @@ def _command_parts(
                     prelude.append(f"{public}.to_cstruct(&{public}_native);")
                     arguments.append(f"&{public}_native.value")
                     from_args = _command_struct_from_arguments(
-                        param.type, receiver, item, bound, registry, config
+                        param.type, receiver, command, bound, ir, config
                     )
                     postlude.append(
-                        f"{public}.from_cstruct({public}_native.value{from_args});{_output_chain_refresh(param.type, public, registry)}"
+                        f"{public}.from_cstruct({public}_native.value{from_args});{_output_chain_refresh(param.type, public, ir)}"
                     )
                 else:
                     prelude.append(
@@ -2519,11 +2474,11 @@ def _command_parts(
                     )
                     arguments.append(f"{public} ? &{public}_native.value : nullptr")
                     from_args = _command_struct_from_arguments(
-                        param.type, receiver, item, bound, registry, config
+                        param.type, receiver, command, bound, ir, config
                     )
                     refresh = (
                         f" {public}->nextInChain.refresh();"
-                        if _has_pnext(param.type, registry)
+                        if _has_pnext(param.type, ir)
                         else ""
                     )
                     postlude.append(
@@ -2532,48 +2487,44 @@ def _command_parts(
             continue
 
         if param.pointer_depth == 1 and category == "handle":
-            cpp = _cpp_type(param.type, registry, config)
+            cpp = _cpp_type(param.type, ir, config)
             if param.const:
                 prelude.append(
-                    f"{param.type} {public}_native = {public} ? {public}->raw() : {param.type}{{}};"
+                    f"{param.c_type} {public}_native = {public} ? {public}->raw() : {param.c_type}{{}};"
                 )
                 arguments.append(f"&{public}_native")
             else:
-                prelude.append(f"{param.type} {public}_native{{}};")
+                prelude.append(f"{param.c_type} {public}_native{{}};")
                 arguments.append(
                     f"&{public}_native"
                     if is_value_output
                     else f"{public} ? &{public}_native : nullptr"
                 )
                 parent = _output_handle_parent_expression(
-                    param.type, receiver, item.command.params, bound, registry
+                    param.type, receiver, command.params, bound, ir
                 )
-                release = releasers.get(param.type)
-                owned = release is not None and is_owned_handle_output(
-                    item.command, param, releasers
-                )
+                release = _releaser_command(param.type, ir)
+                owned = release is not None and _is_owned_handle_output(command, param)
                 ownership_condition = (
-                    _handle_ownership_condition(param, item.command, registry, config)
+                    _handle_ownership_condition(param, command, ir, config)
                     if owned
                     else None
                 )
                 destroyer = (
                     _handle_release_lambda(
-                        param, item.command, release, receiver, bound, registry, config
+                        param, command, release, receiver, bound, ir, config
                     )
                     if owned and release is not None
                     else None
                 )
                 record = (
-                    _creation_record_expression(
-                        param, item.command, None, registry, config
-                    )
+                    _creation_record_expression(param, command, None, ir, config)
                     if owned
                     else None
                 )
                 if owned and destroyer is None:
                     raise ValueError(
-                        f"cannot infer release provenance for {item.command.name}.{param.name}"
+                        f"cannot infer release provenance for {command.c_name}.{param.name}"
                     )
                 if owned:
                     cleanup_call = (
@@ -2582,7 +2533,7 @@ def _command_parts(
                         else f"{public}_cleanup({public}_native)"
                     )
                     cleanup_lines = [
-                        f"if ({public}_native != {param.type}{{}}) {{",
+                        f"if ({public}_native != {param.c_type}{{}}) {{",
                         f"    auto {public}_cleanup = {destroyer};",
                         f"    {cleanup_call};",
                         "}",
@@ -2606,7 +2557,7 @@ def _command_parts(
                     if parent:
                         adopt_wrap += f", {parent}"
                     adopt_wrap += f", {destroyer}"
-                    if creation_info_for_handle(registry, registry.types[param.type]):
+                    if ir.handles[param.type].create_info:
                         adopt_wrap += f", {record or '{}'}"
                     adopt_wrap += ")"
                     wrap = (
@@ -2621,7 +2572,7 @@ def _command_parts(
                     if status_value_result
                     else (
                         "return std::unexpected(wrapped.error());"
-                        if value_outputs and item.command.return_type == "VkResult"
+                        if value_outputs and command.c_return_type == "VkResult"
                         else (
                             "return std::unexpected(wrapped.error());"
                             if result == "Result<void>"
@@ -2631,23 +2582,23 @@ def _command_parts(
                 )
                 if is_value_output:
                     postlude.append(
-                        f"if ({public}_native != {param.type}{{}}) {{ auto wrapped = {wrap}; if (!wrapped) {{ {failure} }} else {public} = std::move(*wrapped); }}"
+                        f"if ({public}_native != {param.c_type}{{}}) {{ auto wrapped = {wrap}; if (!wrapped) {{ {failure} }} else {public} = std::move(*wrapped); }}"
                     )
                 else:
                     postlude.append(
-                        f"if ({public}) {{ if ({public}_native == {param.type}{{}}) {public}->reset(); else {{ auto wrapped = {wrap}; if (!wrapped) {{ {failure} }} else *{public} = std::move(*wrapped); }} }}"
+                        f"if ({public}) {{ if ({public}_native == {param.c_type}{{}}) {public}->reset(); else {{ auto wrapped = {wrap}; if (!wrapped) {{ {failure} }} else *{public} = std::move(*wrapped); }} }}"
                     )
             continue
 
         if param.pointer_depth == 1 and category in {"enum", "bitmask"}:
-            cpp = _cpp_type(param.type, registry, config)
+            cpp = _cpp_type(param.type, ir, config)
             if param.const:
                 prelude.append(
-                    f"{param.type} {public}_native = {public} ? {_native_value(param.type, f'*{public}', registry)} : {param.type}{{}};"
+                    f"{param.c_type} {public}_native = {public} ? {_native_value(param.type, f'*{public}', ir)} : {param.c_type}{{}};"
                 )
                 arguments.append(f"{public} ? &{public}_native : nullptr")
             else:
-                prelude.append(f"{param.type} {public}_native{{}};")
+                prelude.append(f"{param.c_type} {public}_native{{}};")
                 arguments.append(
                     f"&{public}_native"
                     if is_value_output
@@ -2663,7 +2614,7 @@ def _command_parts(
         arguments.append(
             f"&{public}"
             if is_value_output
-            else _public_argument(param, registry, public)
+            else _public_argument(param, ir, public)
         )
 
     if len(value_outputs) > 1:
@@ -2672,19 +2623,12 @@ def _command_parts(
             for output in value_outputs
         )
 
-    if item.command.name == "vkCreateDevice":
-        # Managed devices require Vulkan private data.  Work only on the
-        # native conversion cache, never on the caller's DeviceCreateInfo.
-        # Merge both nodes when already present so the application's chain
-        # remains ordered and contains no redundant wrapper request.
-        result_values = registry.enums.get("VkResult")
+    if command.c_name == "vkCreateDevice":
+        result_values = ir.enums.get("Result")
         overflow_error = (
             "ResultCode::ErrorTooManyObjects"
             if result_values
-            and any(
-                value.name == "VK_ERROR_TOO_MANY_OBJECTS"
-                for value in result_values.values
-            )
+            and any(value.name == "VK_ERROR_TOO_MANY_OBJECTS" for value in result_values.values)
             else "ResultCode::ErrorUnknown"
         )
         prelude.extend(
@@ -2709,14 +2653,14 @@ def _command_parts(
             ]
         )
 
-    call = _dispatch_call(item.command, receiver, registry, arguments)
+    call = _dispatch_call(command, receiver, ir, arguments)
     body = list(prelude)
-    if item.command.return_type == "void":
+    if command.c_return_type == "void":
         body.append(f"{call};")
         body.extend(postlude)
         if value_outputs:
             body.append("return std::move(value);")
-    elif item.command.return_type == "VkResult":
+    elif command.c_return_type == "VkResult":
         body.append(f"auto status = static_cast<ResultCode>({call});")
         if failure_cleanup:
             body.append("if (static_cast<std::int32_t>(status) < 0) {")
@@ -2747,105 +2691,114 @@ def _command_parts(
 
 
 def _method_parts(
-    item: CommandAnalysis, receiver: str, registry: Registry, config: GeneratorConfig
+    command: Command, receiver: str, ir: IrRegistry, config: GeneratorConfig
 ) -> tuple[str, str, str]:
-    return _command_parts(item, receiver, registry, config)
+    return _command_parts(command, receiver, ir, config)
+
+
+def _method_name(
+    command: Command, receiver: str, config: GeneratorConfig
+) -> str:
+    return command.member_name
+
+
+def _callable_name(
+    command: Command, receiver: str | None, config: GeneratorConfig
+) -> str:
+    return command.member_name if receiver is not None else command.cpp_name
 
 
 def _method_decl(
-    item: CommandAnalysis, receiver: str, registry: Registry, config: GeneratorConfig
+    command: Command, receiver: str, ir: IrRegistry, config: GeneratorConfig
 ) -> str:
-    result, params, _ = _method_parts(item, receiver, registry, config)
+    result, params, _ = _method_parts(command, receiver, ir, config)
     prefix = "" if result == "void" else "[[nodiscard]] "
     return (
-        f"    {prefix}{result} {_method_name(item, receiver, config)}({params}) const;"
+        f"    {prefix}{result} {_method_name(command, receiver, config)}({params}) const;"
     )
 
 
 def _method_impl(
-    item: CommandAnalysis, receiver: str, registry: Registry, config: GeneratorConfig
+    command: Command, receiver: str, ir: IrRegistry, config: GeneratorConfig
 ) -> str:
-    result, params, body = _method_parts(item, receiver, registry, config)
+    result, params, body = _method_parts(command, receiver, ir, config)
     if not body:
         return ""
-    receiver_name = _cpp_type(receiver, registry, config)
-    return f"inline {result} {receiver_name}::{_method_name(item, receiver, config)}({params}) const {{ {body} }}"
+    receiver_name = _cpp_type(receiver, ir, config)
+    return f"inline {result} {receiver_name}::{_method_name(command, receiver, config)}({params}) const {{ {body} }}"
 
 
 def _convenience_parts(
-    item: CommandAnalysis,
+    command: Command,
     receiver: str | None,
-    registry: Registry,
+    ir: IrRegistry,
     config: GeneratorConfig,
 ) -> tuple[str, str, str] | None:
-    shape = item.output
     if (
-        shape.vector is None
-        or shape.count is None
-        or item.command.return_type not in {"VkResult", "void"}
+        command.vector_output is None
+        or command.count_param is None
+        or command.c_return_type not in {"VkResult", "void"}
     ):
         return None
-    is_void = item.command.return_type == "void"
-    bound = _receiver_param(item, receiver)
-    bound_arguments = _bound_handle_arguments(item, receiver, registry)
-    omitted = {*bound_arguments, id(shape.count), id(shape.vector)}
-    retained = [param for param in item.command.params if id(param) not in omitted]
+    is_void = command.c_return_type == "void"
+    bound = _receiver_param(command, receiver)
+    bound_arguments = _bound_handle_arguments(command, receiver, ir)
+    count = command.param(command.count_param)
+    vector = command.param(command.vector_output)
+    if count is None or vector is None:
+        return None
+    omitted = {*bound_arguments, id(count), id(vector)}
+    retained = [param for param in command.params if id(param) not in omitted]
     params = [
-        f"{_public_param_type(param, registry, config)} {_public_param_name(param)}"
+        f"{_public_param_type(param, ir, config)} {_public_param_name(param)}"
         for param in retained
     ]
-    count_name = shape.count_name or "count"
+    count_name = command.count_name or "count"
     params.append(f"std::uint32_t {count_name} = 0")
     value_type = (
         "std::byte"
-        if shape.vector.type == "void"
-        else _cpp_type(shape.vector.type, registry, config)
+        if vector.type == "void"
+        else _cpp_type(vector.type, ir, config)
     )
-    native_value_type = (
-        "std::byte" if shape.vector.type == "void" else shape.vector.type
-    )
-    vector_category = _type_category(shape.vector.type, registry)
+    native_value_type = "std::byte" if vector.type == "void" else vector.c_type
+    vector_category = _type_category(vector.type, ir)
     result_type = (
         f"std::vector<{value_type}>"
         if is_void
         else (
             f"ResultValue<std::vector<{value_type}>>"
-            if shape.status_value
+            if command.status_alternatives
             else f"Result<std::vector<{value_type}>>"
         )
     )
-    count_type = shape.count.type
+    count_type = count.c_type
     prelude: list[str] = []
     postlude: list[str] = []
     arguments: list[str] = []
-    for param in item.command.params:
+    for param in command.params:
         public_name = _public_param_name(param)
         if id(param) in bound_arguments:
             arguments.append(bound_arguments[id(param)])
-        elif param is shape.count:
+        elif param is count:
             arguments.append("&written" if param.pointer_depth else "written")
-        elif param is shape.vector:
+        elif param is vector:
             pointer = "native_values.empty() ? nullptr : native_values.data()"
             if param.type == "void":
                 pointer = f"reinterpret_cast<void*>({pointer})"
             arguments.append(pointer)
         else:
-            category = _type_category(param.type, registry)
+            category = _type_category(param.type, ir)
             if param.pointer_depth == 0 and category == "handle":
-                arguments.append(
-                    f"{public_name} ? {public_name}->raw() : {param.type}{{}}"
-                    if "true" in param.optional
-                    else f"{public_name}.raw()"
-                )
+                arguments.append(f"{public_name}.raw()")
             elif param.pointer_depth == 0 and category in {"enum", "bitmask"}:
-                arguments.append(_native_value(param.type, public_name, registry))
+                arguments.append(_native_value(param.type, public_name, ir))
             elif (
                 param.const
                 and param.type == "char"
                 and param.pointer_depth == 1
-                and "null-terminated" in param.length
+                and "null-terminated" in _lengths(param)
             ):
-                if "true" in param.optional:
+                if param.is_optional:
                     prelude.append(
                         f"std::optional<std::string> {public_name}_native = {public_name} ? std::optional<std::string>(std::in_place, *{public_name}) : std::nullopt;"
                     )
@@ -2856,16 +2809,16 @@ def _convenience_parts(
                     prelude.append(f"std::string {public_name}_native({public_name});")
                     arguments.append(f"{public_name}_native.c_str()")
             elif (
-                param.length
-                and "null-terminated" not in param.length
+                _lengths(param)
+                and "null-terminated" not in _lengths(param)
                 and param.type != "void"
             ):
                 if category == "struct":
-                    cpp = _cpp_type(param.type, registry, config)
+                    cpp = _cpp_type(param.type, ir, config)
                     prelude.extend(
                         [
                             f"std::vector<{cpp}::CStruct> {public_name}_cache({public_name}.size());",
-                            f"std::vector<{param.type}> {public_name}_native({public_name}.size());",
+                            f"std::vector<{param.c_type}> {public_name}_native({public_name}.size());",
                         ]
                     )
                     if param.const:
@@ -2877,10 +2830,10 @@ def _convenience_parts(
                             f"for (std::size_t i = 0; i < {public_name}.size(); ++i) {{ {public_name}[i].to_cstruct(&{public_name}_cache[i]); {public_name}_native[i] = {public_name}_cache[i].value; }}"
                         )
                         from_args = _command_struct_from_arguments(
-                            param.type, receiver, item, bound, registry, config
+                            param.type, receiver, command, bound, ir, config
                         )
                         postlude.append(
-                            f"for (std::size_t i = 0; i < {public_name}.size(); ++i) {{ {public_name}[i].from_cstruct({public_name}_native[i]{from_args});{_output_chain_refresh(param.type, f'{public_name}[i]', registry)} }}"
+                            f"for (std::size_t i = 0; i < {public_name}.size(); ++i) {{ {public_name}[i].from_cstruct({public_name}_native[i]{from_args});{_output_chain_refresh(param.type, f'{public_name}[i]', ir)} }}"
                         )
                     arguments.append(
                         f"{public_name}_native.empty() ? nullptr : {public_name}_native.data()"
@@ -2888,7 +2841,7 @@ def _convenience_parts(
                 elif category == "handle":
                     prelude.extend(
                         [
-                            f"std::vector<{param.type}> {public_name}_native({public_name}.size());",
+                            f"std::vector<{param.c_type}> {public_name}_native({public_name}.size());",
                             f"for (std::size_t i = 0; i < {public_name}.size(); ++i) {public_name}_native[i] = {public_name}[i].raw();",
                         ]
                     )
@@ -2898,8 +2851,8 @@ def _convenience_parts(
                 elif category in {"enum", "bitmask"}:
                     prelude.extend(
                         [
-                            f"std::vector<{param.type}> {public_name}_native({public_name}.size());",
-                            f"for (std::size_t i = 0; i < {public_name}.size(); ++i) {public_name}_native[i] = {_native_value(param.type, f'{public_name}[i]', registry)};",
+                            f"std::vector<{param.c_type}> {public_name}_native({public_name}.size());",
+                            f"for (std::size_t i = 0; i < {public_name}.size(); ++i) {public_name}_native[i] = {_native_value(param.type, f'{public_name}[i]', ir)};",
                         ]
                     )
                     arguments.append(
@@ -2910,9 +2863,9 @@ def _convenience_parts(
                         f"{public_name}.empty() ? nullptr : {public_name}.data()"
                     )
             elif param.pointer_depth == 1 and category == "struct":
-                cpp = _cpp_type(param.type, registry, config)
+                cpp = _cpp_type(param.type, ir, config)
                 prelude.append(f"{cpp}::CStruct {public_name}_native{{}};")
-                if param.const and "true" in param.optional:
+                if param.const and param.is_optional:
                     prelude.append(
                         f"if ({public_name}) {public_name}->get().to_cstruct(&{public_name}_native);"
                     )
@@ -2930,22 +2883,22 @@ def _convenience_parts(
                         f"{public_name} ? &{public_name}_native.value : nullptr"
                     )
                     from_args = _command_struct_from_arguments(
-                        param.type, receiver, item, bound, registry, config
+                        param.type, receiver, command, bound, ir, config
                     )
                     refresh = (
                         f" {public_name}->nextInChain.refresh();"
-                        if _has_pnext(param.type, registry)
+                        if _has_pnext(param.type, ir)
                         else ""
                     )
                     postlude.append(
                         f"if ({public_name}) {{ {public_name}->from_cstruct({public_name}_native.value{from_args});{refresh} }}"
                     )
             else:
-                arguments.append(_public_argument(param, registry))
-    call = _dispatch_call(item.command, receiver, registry, arguments)
+                arguments.append(_public_argument(param, ir))
+    call = _dispatch_call(command, receiver, ir, arguments)
     null_arguments = list(arguments)
-    null_arguments[item.command.params.index(shape.vector)] = "nullptr"
-    null_call = _dispatch_call(item.command, receiver, registry, null_arguments)
+    null_arguments[command.params.index(vector)] = "nullptr"
+    null_call = _dispatch_call(command, receiver, ir, null_arguments)
     struct_storage = []
     struct_prepare = []
     if vector_category == "struct":
@@ -2959,7 +2912,7 @@ def _convenience_parts(
             "        };",
         ]
         struct_prepare = ["        prepare_native_values();"]
-    if shape.count.pointer_depth:
+    if count.pointer_depth:
         if is_void:
             body = [
                 f"        {count_type} written = static_cast<{count_type}>({count_name});",
@@ -2985,7 +2938,7 @@ def _convenience_parts(
                 "            if (static_cast<std::int32_t>(status) < 0) "
                 + (
                     "return ResultValue<std::vector<" + value_type + ">>{status, {}};"
-                    if shape.status_value
+                    if command.status_alternatives
                     else "return std::unexpected(status);"
                 ),
                 "        }",
@@ -3003,10 +2956,10 @@ def _convenience_parts(
                 "            " + count_type + " required{};",
             ]
             retry_args = list(null_arguments)
-            retry_args[item.command.params.index(shape.count)] = "&required"
+            retry_args[command.params.index(count)] = "&required"
             body.extend(
                 [
-                    f"            status = static_cast<ResultCode>({_dispatch_call(item.command, receiver, registry, retry_args)});",
+                    f"            status = static_cast<ResultCode>({_dispatch_call(command, receiver, ir, retry_args)});",
                     "            if (static_cast<std::int32_t>(status) < 0) break;",
                     "            native_values.resize(required);",
                     "        } while (true);",
@@ -3022,16 +2975,16 @@ def _convenience_parts(
         ]
     body.extend(f"        {line}" for line in postlude)
     category = vector_category
-    if shape.vector.type == "void":
+    if vector.type == "void":
         body.append("        auto values = std::move(native_values);")
     elif category == "struct":
         from_args = _command_struct_from_arguments(
-            shape.vector.type, receiver, item, bound, registry, config
+            vector.type, receiver, command, bound, ir, config
         )
         body.extend(
             [
                 "        values.resize(native_values.size());",
-                f"        for (std::size_t i = 0; i < values.size(); ++i) {{ values[i].from_cstruct(native_values[i]{from_args});{_output_chain_refresh(shape.vector.type, 'values[i]', registry)} }}",
+                f"        for (std::size_t i = 0; i < values.size(); ++i) {{ values[i].from_cstruct(native_values[i]{from_args});{_output_chain_refresh(vector.type, 'values[i]', ir)} }}",
             ]
         )
     elif category in {"enum", "bitmask"}:
@@ -3044,10 +2997,8 @@ def _convenience_parts(
     elif category == "union":
         body.append("        auto values = std::move(native_values);")
     elif category == "handle":
-        # Enumeration commands return borrowed handles.  Resolve the concrete
-        # parent from the receiver where possible; no owner template is used.
         parent_expr = _output_handle_parent_expression(
-            shape.vector.type, receiver, item.command.params, bound, registry
+            vector.type, receiver, command.params, bound, ir
         )
         borrow_args = "native_values[i]" + (f", {parent_expr}" if parent_expr else "")
         body.extend(
@@ -3057,7 +3008,7 @@ def _convenience_parts(
                 f"        for (std::size_t i = 0; i < native_values.size(); ++i) {{ auto wrapped = {value_type}::borrow({borrow_args}); if (!wrapped) "
                 + (
                     f"return ResultValue<std::vector<{value_type}>>{{wrapped.error(), {{}}}};"
-                    if shape.status_value
+                    if command.status_alternatives
                     else "return std::unexpected(wrapped.error());"
                 )
                 + " values.push_back(std::move(*wrapped)); }",
@@ -3069,7 +3020,7 @@ def _convenience_parts(
         )
     if is_void:
         body.append("        return values;")
-    elif shape.status_value:
+    elif command.status_alternatives:
         body.append(
             f"        return ResultValue<std::vector<{value_type}>>{{status, std::move(values)}};"
         )
@@ -3089,43 +3040,43 @@ def _convenience_parts(
 
 
 def _convenience_decl(
-    item: CommandAnalysis,
+    command: Command,
     receiver: str | None,
-    registry: Registry,
+    ir: IrRegistry,
     config: GeneratorConfig,
 ) -> str | None:
-    parts = _convenience_parts(item, receiver, registry, config)
+    parts = _convenience_parts(command, receiver, ir, config)
     if parts is None:
         return None
     result, params, _ = parts
-    return f"    [[nodiscard]] {result} {_callable_name(item, receiver, config)}({params}) const;"
+    return f"    [[nodiscard]] {result} {_callable_name(command, receiver, config)}({params}) const;"
 
 
 def _convenience_impl(
-    item: CommandAnalysis,
+    command: Command,
     receiver: str | None,
-    registry: Registry,
+    ir: IrRegistry,
     config: GeneratorConfig,
 ) -> str | None:
-    parts = _convenience_parts(item, receiver, registry, config)
+    parts = _convenience_parts(command, receiver, ir, config)
     if parts is None:
         return None
     result, params, body = parts
     params = re.sub(r"\s*=\s*0(?=,|$)", "", params)
     receiver_name = (
-        _cpp_type(receiver, registry, config) if receiver is not None else "Context"
+        _cpp_type(receiver, ir, config) if receiver is not None else "Context"
     )
     indented = "\n".join(f"    {line}" if line else "" for line in body.splitlines())
-    return f"inline {result} {receiver_name}::{_callable_name(item, receiver, config)}({params}) const {{\n{indented}\n}}"
+    return f"inline {result} {receiver_name}::{_callable_name(command, receiver, config)}({params}) const {{\n{indented}\n}}"
 
 
 def _output_size_expression(
-    output: Member, command: Command, registry: Registry
+    output: Param, command: Command, ir: IrRegistry
 ) -> str | None:
-    if not output.length:
+    if not _lengths(output):
         return None
     length = next(
-        (value for value in output.length if value != "null-terminated"), None
+        (value for value in _lengths(output) if value != "null-terminated"), None
     )
     if length is None:
         return None
@@ -3139,7 +3090,7 @@ def _output_size_expression(
                 for param in command.params
                 if param is not output
                 and param.const
-                and length in param.length
+                and length in _lengths(param)
                 and param.pointer_depth
             ),
             None,
@@ -3156,7 +3107,7 @@ def _output_size_expression(
         )
         if param is None:
             return None
-        struct = registry.types.get(param.type)
+        struct = _as_struct(ir, param.type)
         if struct is None or struct.category != "struct":
             return None
         public = _public_param_name(param)
@@ -3170,59 +3121,55 @@ def _output_size_expression(
 
 
 def _owned_handle_convenience_parts(
-    item: CommandAnalysis,
+    command: Command,
     receiver: str | None,
-    registry: Registry,
+    ir: IrRegistry,
     config: GeneratorConfig,
 ) -> tuple[str, str, str] | None:
-    if item.command.return_type not in {"VkResult", "void"}:
+    if command.c_return_type not in {"VkResult", "void"}:
         return None
-    # Enumeration overloads have their own status-preserving retry path.
-    # Other commands with multiple success codes also need a direct native
-    # convenience path so a meaningful positive status is not discarded by
-    # the Result<void> raw overload.
-    if item.output.vector is not None:
+    if command.vector_output is not None:
         return None
-    if len(item.output.outputs) != 1:
+    if len(command.outputs) != 1:
         return None
-    output = item.output.outputs[0]
-    if output.type == "void":
+    output = command.param(command.outputs[0])
+    if output is None or output.type == "void":
         return None
-    if item.command.return_type == "VkResult" and len(item.command.success_codes) > 1:
-        result, params, body = _command_parts(item, receiver, registry, config, output)
+    if command.c_return_type == "VkResult" and len(command.success_codes) > 1:
+        result, params, body = _command_parts(command, receiver, ir, config, output)
         return (result, params, body) if body else None
-    bound_arguments = _bound_handle_arguments(item, receiver, registry)
+    bound_arguments = _bound_handle_arguments(command, receiver, ir)
     span_lengths: set[str] = set()
-    for param in item.command.params:
-        if param.const and param.length and "null-terminated" not in param.length:
+    for param in command.params:
+        if param.const and _lengths(param) and "null-terminated" not in _lengths(param):
             span_lengths.update(
                 length
-                for length in param.length
+                for length in _lengths(param)
                 if re.fullmatch(r"[A-Za-z_]\w*", length)
             )
     visible = [
         param
-        for param in item.command.params
+        for param in command.params
         if id(param) not in bound_arguments and param.name not in span_lengths
     ]
     retained = [param for param in visible if param is not output]
     params = ", ".join(
-        f"{_public_param_type(param, registry, config)} {_public_param_name(param)}"
+        f"{_public_param_type(param, ir, config)} {_public_param_name(param)}"
         for param in retained
     )
-    cpp = _cpp_type(output.type, registry, config)
-    size = _output_size_expression(output, item.command, registry)
-    method = _callable_name(item, receiver, config)
-    output_argument = "values" if output.length else "&value"
+    cpp = _cpp_type(output.type, ir, config)
+    size = _output_size_expression(output, command, ir)
+    method = _callable_name(command, receiver, config)
+    output_argument = "values" if _lengths(output) else "&value"
     call_arguments = ", ".join(
         output_argument if param is output else _public_param_name(param)
         for param in visible
     )
-    if output.length:
+    if _lengths(output):
         if size is None:
             return None
         value_type = f"std::vector<{cpp}>"
-        if item.command.return_type == "VkResult":
+        if command.c_return_type == "VkResult":
             result = f"Result<{value_type}>"
             body = (
                 f"{value_type} values(static_cast<std::size_t>({size})); auto status = {method}({call_arguments}); "
@@ -3232,7 +3179,7 @@ def _owned_handle_convenience_parts(
             result = value_type
             body = f"{value_type} values(static_cast<std::size_t>({size})); {method}({call_arguments}); return values;"
     else:
-        if item.command.return_type == "VkResult":
+        if command.c_return_type == "VkResult":
             result = f"Result<{cpp}>"
             body = (
                 f"{cpp} value{{}}; auto status = {method}({call_arguments}); "
@@ -3245,71 +3192,73 @@ def _owned_handle_convenience_parts(
 
 
 def _owned_handle_convenience_decl(
-    item: CommandAnalysis,
+    command: Command,
     receiver: str | None,
-    registry: Registry,
+    ir: IrRegistry,
     config: GeneratorConfig,
 ) -> str | None:
-    parts = _owned_handle_convenience_parts(item, receiver, registry, config)
+    parts = _owned_handle_convenience_parts(command, receiver, ir, config)
     if parts is None:
         return None
     result, params, _ = parts
-    return f"    [[nodiscard]] {result} {_callable_name(item, receiver, config)}({params}) const;"
+    return f"    [[nodiscard]] {result} {_callable_name(command, receiver, config)}({params}) const;"
 
 
 def _owned_handle_convenience_impl(
-    item: CommandAnalysis,
+    command: Command,
     receiver: str | None,
-    registry: Registry,
+    ir: IrRegistry,
     config: GeneratorConfig,
 ) -> str | None:
-    parts = _owned_handle_convenience_parts(item, receiver, registry, config)
+    parts = _owned_handle_convenience_parts(command, receiver, ir, config)
     if parts is None:
         return None
     result, params, body = parts
     receiver_name = (
-        _cpp_type(receiver, registry, config) if receiver is not None else "Context"
+        _cpp_type(receiver, ir, config) if receiver is not None else "Context"
     )
-    return f"inline {result} {receiver_name}::{_callable_name(item, receiver, config)}({params}) const {{ {body} }}"
+    return f"inline {result} {receiver_name}::{_callable_name(command, receiver, config)}({params}) const {{ {body} }}"
 
 
 def _multi_output_parts(
-    item: CommandAnalysis,
+    command: Command,
     receiver: str | None,
-    registry: Registry,
+    ir: IrRegistry,
     config: GeneratorConfig,
 ) -> tuple[str, str, str] | None:
-    outputs = item.output.outputs
+    outputs = tuple(command.param(name) for name in command.outputs)
+    outputs = tuple(param for param in outputs if param is not None)
     if (
-        item.command.return_type != "VkResult"
-        or item.output.vector is not None
+        command.c_return_type != "VkResult"
+        or command.vector_output is not None
         or len(outputs) < 2
     ):
         return None
     if any(
         output.type == "void"
         or (
-            output.length
-            and _output_size_expression(output, item.command, registry) is None
+            _lengths(output)
+            and _output_size_expression(output, command, ir) is None
         )
         for output in outputs
     ):
         return None
-    result, params, body = _command_parts(item, receiver, registry, config, outputs)
+    result, params, body = _command_parts(command, receiver, ir, config, outputs)
     return (result, params, body) if body else None
 
 
-def _has_multi_output_result(item: CommandAnalysis, registry: Registry) -> bool:
-    outputs = item.output.outputs
+def _has_multi_output_result(command: Command, ir: IrRegistry) -> bool:
+    outputs = tuple(command.param(name) for name in command.outputs)
+    outputs = tuple(param for param in outputs if param is not None)
     return (
-        item.command.return_type == "VkResult"
-        and item.output.vector is None
+        command.c_return_type == "VkResult"
+        and command.vector_output is None
         and len(outputs) >= 2
         and all(
             output.type != "void"
             and (
-                not output.length
-                or _output_size_expression(output, item.command, registry) is not None
+                not _lengths(output)
+                or _output_size_expression(output, command, ir) is not None
             )
             for output in outputs
         )
@@ -3317,56 +3266,65 @@ def _has_multi_output_result(item: CommandAnalysis, registry: Registry) -> bool:
 
 
 def _multi_output_decl(
-    item: CommandAnalysis,
+    command: Command,
     receiver: str | None,
-    registry: Registry,
+    ir: IrRegistry,
     config: GeneratorConfig,
 ) -> str | None:
-    parts = _multi_output_parts(item, receiver, registry, config)
+    parts = _multi_output_parts(command, receiver, ir, config)
     if parts is None:
         return None
     result, params, _ = parts
-    return f"    [[nodiscard]] {result} {_callable_name(item, receiver, config)}({params}) const;"
+    return f"    [[nodiscard]] {result} {_callable_name(command, receiver, config)}({params}) const;"
 
 
 def _multi_output_impl(
-    item: CommandAnalysis,
+    command: Command,
     receiver: str | None,
-    registry: Registry,
+    ir: IrRegistry,
     config: GeneratorConfig,
 ) -> str | None:
-    parts = _multi_output_parts(item, receiver, registry, config)
+    parts = _multi_output_parts(command, receiver, ir, config)
     if parts is None:
         return None
     result, params, body = parts
     receiver_name = (
-        _cpp_type(receiver, registry, config) if receiver is not None else "Context"
+        _cpp_type(receiver, ir, config) if receiver is not None else "Context"
     )
-    return f"inline {result} {receiver_name}::{_callable_name(item, receiver, config)}({params}) const {{ {body} }}"
+    return f"inline {result} {receiver_name}::{_callable_name(command, receiver, config)}({params}) const {{ {body} }}"
+
+
+# ---------------------------------------------------------------------------
+# Handle emission
+# ---------------------------------------------------------------------------
+
+def _handle_commands(handle: Handle, ir: IrRegistry) -> list[Command]:
+    return [
+        command
+        for command in ir.commands.values()
+        if command.active and handle.name in command.receivers
+    ]
 
 
 def _emit_handle(
-    item: HandleAnalysis,
-    analysis: ApiAnalysis,
-    registry: Registry,
+    handle: Handle,
+    ir: IrRegistry,
     config: GeneratorConfig,
     injection: list[str],
     vma_resources: frozenset[str],
 ) -> str:
-    h = item.type
-    name = item.cpp_name
-    parent = _cpp_type(h.parent.split(",")[0], registry, config) if h.parent else None
+    name = _cpp_type(handle.name, ir, config)
+    parent = _cpp_type(handle.parent, ir, config) if handle.parent else None
     state_name = f"{name}ControlBlock"
     state_lines = [
         f"namespace detail {{ struct {state_name} final : LifetimeHeader {{",
-        f"    using native_type = {h.name};",
-        # Serializes lookup/retain against detach/final release.  Host-tracked
-        # types also use it for their map; device-scoped types have no map and
-        # use Vulkan private data as the association store.
+        f"    using native_type = {handle.c_name};",
         "    inline static std::shared_mutex tracking_mutex;",
         "    native_type native{};",
     ]
-    uses_host_registry = not _is_device_scope(h, registry) or h.name == "VkDevice"
+    uses_host_registry = (
+        not _is_device_scope(handle, ir) or handle.c_name == "VkDevice"
+    )
     if uses_host_registry:
         state_lines.append(
             f"    inline static std::unordered_multimap<std::uint64_t, {state_name}*> registry;"
@@ -3379,9 +3337,9 @@ def _emit_handle(
             f"    std::function<void({'const ' + parent + '&, ' if parent else ''}native_type)> destroyer;",
         ]
     )
-    if h.name == "VkInstance":
+    if handle.c_name == "VkInstance":
         state_lines.append("    VolkInstanceTable instance_dispatch{};")
-    elif h.name == "VkDevice":
+    elif handle.c_name == "VkDevice":
         state_lines.extend(
             [
                 "    std::shared_mutex private_data_mutex;",
@@ -3389,11 +3347,11 @@ def _emit_handle(
                 "    VolkDeviceTable device_dispatch{};",
             ]
         )
-    if item.create_info:
+    if handle.create_info:
         state_lines.append(
-            f"    std::shared_ptr<const {_cpp_type(item.create_info, registry, config)}> create_info;"
+            f"    std::shared_ptr<const {_cpp_type(handle.create_info, ir, config)}> create_info;"
         )
-    vma_resource = h.name in vma_resources
+    vma_resource = handle.c_name in vma_resources
     if vma_resource:
         state_lines.extend(
             [
@@ -3415,7 +3373,7 @@ def _emit_handle(
         "\n".join(state_lines),
         f"class {name} {{",
         "  public:",
-        f"    using native_type = {h.name};",
+        f"    using native_type = {handle.c_name};",
         "  private:",
         "    native_type native_{};",
     ]
@@ -3425,25 +3383,28 @@ def _emit_handle(
         lines.append("    VolkInstanceTable dispatch_{};")
     lines.append(f"    mutable detail::{state_name}* ctrl_{{}};")
     lines.append("    friend struct detail::ExternsyncAccess;")
+    lines.append("    friend struct detail::HandleAccess;")
     lines.append(
         "    template <typename Handle> friend bool detail::same_object(const Handle&, const Handle&) noexcept;"
     )
-    releasers = handle_releasers(registry, {handle.name for handle in registry.handles})
-    producer_receivers: set[str | None] = set()
-    for command in analysis.commands:
-        if any(
-            output.type == h.name
-            and is_owned_handle_output(command.command, output, releasers)
-            for output in command.output.outputs
-        ):
-            producer_receivers.update(command.receivers or (None,))
-    for producer_receiver in sorted(producer_receivers, key=lambda value: value or ""):
-        if producer_receiver is None:
-            lines.append("    friend class Context;")
-        elif producer_receiver in analysis.handles:
-            lines.append(
-                f"    friend class {_cpp_type(producer_receiver, registry, config)};"
-            )
+    # Handles navigate each other's private parent/dispatch/association
+    # plumbing, so every handle type is a friend of every other handle type.
+    for other in ir.handles.values():
+        if other.active and other.name != handle.name:
+            lines.append(f"    friend class {_cpp_type(other.name, ir, config)};")
+    produced_from_context = any(
+        command.active
+        and not command.receivers
+        and any(
+            command.param(name) is not None
+            and command.param(name).type == handle.name
+            and _is_owned_handle_output(command, command.param(name))
+            for name in command.outputs
+        )
+        for command in ir.commands.values()
+    )
+    if produced_from_context:
+        lines.append("    friend class Context;")
     lines.append(f"    explicit {name}(detail::{state_name}* state) noexcept;")
     borrowed_arguments = (
         f"native_type native, {parent} parent" if parent else "native_type native"
@@ -3454,12 +3415,39 @@ def _emit_handle(
         f"std::function<void({'const ' + parent + '&, ' if parent else ''}native_type)>"
     )
     factory_record_arg = ""
-    if item.create_info:
-        factory_record_arg = f", std::shared_ptr<const {_cpp_type(item.create_info, registry, config)}> creationRecord"
+    if handle.create_info:
+        factory_record_arg = f", std::shared_ptr<const {_cpp_type(handle.create_info, ir, config)}> creationRecord"
     lines.append(
         f"    [[nodiscard]] static Result<{name}> makeOwned(native_type native{factory_parent_arg}, "
         f"{factory_destroyer} destroyer{factory_record_arg});"
     )
+    # Internal plumbing stays private; other generated handle wrappers reach
+    # it through the mutual friend declarations above.
+    if handle.c_name == "VkDevice":
+        association_expr = (
+            "ctrl_ ? ctrl_->device_association : detail::DeviceAssociation{}"
+        )
+        dispatch_expr = "detail::DispatchState{parent().dispatchState().instance, ctrl_ ? &ctrl_->device_dispatch : nullptr, native_}"
+    elif handle.c_name == "VkInstance":
+        association_expr = "detail::DeviceAssociation{}"
+        dispatch_expr = "detail::DispatchState{ctrl_ ? &ctrl_->instance_dispatch : &dispatch_, nullptr, {}}"
+    else:
+        association_expr = (
+            "parent().deviceAssociation()"
+            if parent and _is_device_scope(handle, ir)
+            else "detail::DeviceAssociation{}"
+        )
+        dispatch_expr = "parent().dispatchState()" if parent else "dispatch_"
+    lines.append(
+        f"    [[nodiscard]] detail::DeviceAssociation deviceAssociation() const noexcept {{ return {association_expr}; }}"
+    )
+    lines.append(
+        f"    [[nodiscard]] detail::DispatchState dispatchState() const noexcept {{ return {dispatch_expr}; }}"
+    )
+    if parent:
+        lines.append(
+            f"    [[nodiscard]] const {parent}& parent() const noexcept {{ return ctrl_ ? ctrl_->parent : parent_; }}"
+        )
     lines.extend(
         [
             "  public:",
@@ -3479,33 +3467,8 @@ def _emit_handle(
             f"    friend bool operator==(const {name}& lhs, const {name}& rhs) noexcept {{ return lhs.ctrl_ == rhs.ctrl_ && lhs.raw() == rhs.raw(); }}",
         ]
     )
-    if h.name == "VkDevice":
-        association_expr = (
-            "ctrl_ ? ctrl_->device_association : detail::DeviceAssociation{}"
-        )
-        dispatch_expr = "detail::DispatchState{parent().dispatchState().instance, ctrl_ ? &ctrl_->device_dispatch : nullptr, native_}"
-    elif h.name == "VkInstance":
-        association_expr = "detail::DeviceAssociation{}"
-        dispatch_expr = "detail::DispatchState{ctrl_ ? &ctrl_->instance_dispatch : &dispatch_, nullptr, {}}"
-    else:
-        association_expr = (
-            "parent().deviceAssociation()"
-            if parent and _is_device_scope(h, registry)
-            else "detail::DeviceAssociation{}"
-        )
-        dispatch_expr = "parent().dispatchState()" if parent else "dispatch_"
-    lines.append(
-        f"    [[nodiscard]] detail::DeviceAssociation deviceAssociation() const noexcept {{ return {association_expr}; }}"
-    )
-    lines.append(
-        f"    [[nodiscard]] detail::DispatchState dispatchState() const noexcept {{ return {dispatch_expr}; }}"
-    )
-    if parent:
-        lines.append(
-            f"    [[nodiscard]] const {parent}& parent() const noexcept {{ return ctrl_ ? ctrl_->parent : parent_; }}"
-        )
-    if item.create_info:
-        cpp_info = _cpp_type(item.create_info, registry, config)
+    if handle.create_info:
+        cpp_info = _cpp_type(handle.create_info, ir, config)
         lines.append(
             f"    [[nodiscard]] const {cpp_info}* createInfo() const noexcept {{ return ctrl_ ? ctrl_->create_info.get() : nullptr; }}"
         )
@@ -3531,47 +3494,47 @@ def _emit_handle(
         f"    [[nodiscard]] static Result<{name}> borrow(native_type native{adoption});"
     )
     create_info_arg = ""
-    if item.create_info:
-        cpp_info = _cpp_type(item.create_info, registry, config)
+    if handle.create_info:
+        cpp_info = _cpp_type(handle.create_info, ir, config)
         create_info_arg = f", std::shared_ptr<const {cpp_info}> creationRecord = {{}}"
     lines.append(
         f"    [[nodiscard]] static Result<{name}> adopt(native_type native{adoption}, std::function<void(native_type)> destroyer{create_info_arg});"
     )
     if vma_resource and parent:
         create_record = (
-            f", std::shared_ptr<const {_cpp_type(item.create_info, registry, config)}> creationRecord"
-            if item.create_info
+            f", std::shared_ptr<const {_cpp_type(handle.create_info, ir, config)}> creationRecord"
+            if handle.create_info
             else ""
         )
         lines.append(
             f"    [[nodiscard]] static Result<{name}> adoptVma(native_type native, const {parent}& parent, std::shared_ptr<void> allocatorLifetime, VmaAllocator allocator, VmaAllocation allocation, const VmaAllocationInfo& allocationInfo, const VmaAllocationCreateInfo& allocationCreateInfo{create_record});"
         )
     seen: set[tuple[str, str]] = set()
-    for command in item.commands:
-        declaration = _method_decl(command, h.name, registry, config)
-        method_name = _method_name(command, h.name, config)
+    for command in _handle_commands(handle, ir):
+        declaration = _method_decl(command, handle.name, ir, config)
+        method_name = _method_name(command, handle.name, config)
         key = (method_name, declaration)
         if key not in seen:
             lines.append(
                 _guard(
                     declaration,
-                    command.command.protect or command.command.availability.protect,
+                    command.protect or command.availability.protect,
                 )
             )
             seen.add(key)
-        convenience = _convenience_decl(command, h.name, registry, config)
+        convenience = _convenience_decl(command, handle.name, ir, config)
         if convenience:
             key = (method_name + "#convenience", convenience)
             if key not in seen:
                 lines.append(
                     _guard(
                         convenience,
-                        command.command.protect or command.command.availability.protect,
+                        command.protect or command.availability.protect,
                     )
                 )
                 seen.add(key)
         owned_convenience = _owned_handle_convenience_decl(
-            command, h.name, registry, config
+            command, handle.name, ir, config
         )
         if owned_convenience:
             key = (method_name + "#owned", owned_convenience)
@@ -3579,86 +3542,82 @@ def _emit_handle(
                 lines.append(
                     _guard(
                         owned_convenience,
-                        command.command.protect or command.command.availability.protect,
+                        command.protect or command.availability.protect,
                     )
                 )
                 seen.add(key)
-        multi_output = _multi_output_decl(command, h.name, registry, config)
+        multi_output = _multi_output_decl(command, handle.name, ir, config)
         if multi_output:
             key = (method_name + "#multi", multi_output)
             if key not in seen:
                 lines.append(
                     _guard(
                         multi_output,
-                        command.command.protect or command.command.availability.protect,
+                        command.protect or command.availability.protect,
                     )
                 )
                 seen.add(key)
     lines.extend(line.rstrip("\r\n") for line in injection)
     lines.append("};")
-    return _guard("\n".join(lines), h.protect or h.availability.protect)
+    return _guard("\n".join(lines), handle.protect or handle.availability.protect)
 
 
 def _emit_handles(
-    analysis: ApiAnalysis,
-    registry: Registry,
+    ir: IrRegistry,
     config: GeneratorConfig,
     template: Template,
     vma_resources: frozenset[str],
 ) -> str:
-    # Parent wrapper definitions must precede children because parent(),
-    # borrow(), and adopt() are inline and call the parent's public API.
-    pending = list(analysis.handles.values())
-    ordered: list[HandleAnalysis] = []
+    active = [handle for handle in ir.handles.values() if handle.active]
+    pending = list(active)
+    ordered: list[Handle] = []
     emitted: set[str] = set()
     while pending:
         progress = False
-        for item in list(pending):
-            parent = item.type.parent.split(",")[0] if item.type.parent else None
-            if parent not in analysis.handles or parent in emitted:
-                ordered.append(item)
-                emitted.add(item.type.name)
-                pending.remove(item)
+        for handle in list(pending):
+            parent = handle.parent
+            if parent not in ir.handles or parent in emitted:
+                ordered.append(handle)
+                emitted.add(handle.name)
+                pending.remove(handle)
                 progress = True
         if not progress:
             ordered.extend(pending)
             break
     handles = "\n\n".join(
         _emit_handle(
-            item,
-            analysis,
-            registry,
+            handle,
+            ir,
             config,
-            template.injections.get(item.cpp_name, []),
+            template.injections.get(_cpp_type(handle.name, ir, config), []),
             vma_resources,
         )
-        for item in ordered
+        for handle in ordered
     )
-    return handles + "\n\n" + _emit_context(analysis, registry, config)
+    return handles + "\n\n" + _emit_context(ir, config)
 
 
 def _emit_handle_lifetime_impl(
-    item: HandleAnalysis,
-    registry: Registry,
+    handle: Handle,
+    ir: IrRegistry,
     config: GeneratorConfig,
     vma_resources: frozenset[str],
 ) -> str:
-    h = item.type
-    name = item.cpp_name
+    name = _cpp_type(handle.name, ir, config)
     state_name = f"{name}ControlBlock"
-    parent = _cpp_type(h.parent.split(",")[0], registry, config) if h.parent else None
-    object_type = h.object_type_enum or "VK_OBJECT_TYPE_UNKNOWN"
-    device_scope = _is_device_scope(h, registry)
-    vma_resource = h.name in vma_resources
-    uses_host_registry = not device_scope or h.name == "VkDevice"
+    parent = _cpp_type(handle.parent, ir, config) if handle.parent else None
+    object_type = handle.object_type_enum or "VK_OBJECT_TYPE_UNKNOWN"
+    device_scope = _is_device_scope(handle, ir)
+    vma_resource = handle.c_name in vma_resources
+    uses_host_registry = not device_scope or handle.c_name == "VkDevice"
     lines = [
         f"inline void detail::{state_name}::detach(detail::{state_name}* self) noexcept {{"
     ]
     if device_scope:
         association = (
             "self->device_association"
-            if h.name == "VkDevice"
-            else "self->parent.deviceAssociation()"
+            if handle.c_name == "VkDevice"
+            else "detail::HandleAccess::deviceAssociation(self->parent)"
         )
         lines.extend(
             [
@@ -3685,7 +3644,7 @@ def _emit_handle_lifetime_impl(
         ]
     )
     lines.append("        std::unique_lock access(self->externsync);")
-    if h.name == "VkDevice":
+    if handle.c_name == "VkDevice":
         lines.extend(
             [
                 "        if (self->device_association) {",
@@ -3695,7 +3654,7 @@ def _emit_handle_lifetime_impl(
             ]
         )
     if vma_resource:
-        function = "vmaDestroyBuffer" if h.name == "VkBuffer" else "vmaDestroyImage"
+        function = "vmaDestroyBuffer" if handle.c_name == "VkBuffer" else "vmaDestroyImage"
         destroy_call = (
             "self->destroyer(self->parent, self->native)"
             if parent
@@ -3724,12 +3683,9 @@ def _emit_handle_lifetime_impl(
             "}",
         ]
     )
-
     managed_initializers = "native_(state ? state->native : native_type{})"
     if parent:
         managed_initializers += ", parent_{}"
-    elif h.name == "VkInstance":
-        managed_initializers += ", dispatch_{}"
     else:
         managed_initializers += ", dispatch_{}"
     managed_initializers += ", ctrl_(state)"
@@ -3745,7 +3701,6 @@ def _emit_handle_lifetime_impl(
     lines.append(
         f"inline {name}::{name}({borrowed_params}) noexcept : {borrowed_initializers} {{}}"
     )
-
     copy_initializers = (
         "native_(other.native_)"
         + (
@@ -3786,10 +3741,9 @@ def _emit_handle_lifetime_impl(
             f"inline void {name}::reset() noexcept {{ auto* state = std::exchange(ctrl_, nullptr); native_ = {{}}; {reset_tail} if (state) state->release(detail::{state_name}::tracking_mutex, state, &detail::{state_name}::detach, &detail::{state_name}::finalize); }}",
         ]
     )
-
     adoption = f", const {parent}& parent" if parent else ""
     borrowed_ctor = f"{name}(native, parent)" if parent else f"{name}(native)"
-    if h.name == "VkDevice":
+    if handle.c_name == "VkDevice":
         borrow_body = f"if (native == native_type{{}}) return std::unexpected(ResultCode::ErrorUnknown); std::shared_lock lock(detail::{state_name}::tracking_mutex); auto [first, last] = detail::{state_name}::registry.equal_range(detail::raw_key(native)); for (auto found = first; found != last; ++found) if (detail::same_object(found->second->parent, parent)) {{ found->second->retain(); return {name}(found->second); }} lock.unlock(); return {borrowed_ctor};"
     else:
         if device_scope:
@@ -3802,29 +3756,26 @@ def _emit_handle_lifetime_impl(
             )
             lookup = f"std::shared_lock lock(detail::{state_name}::tracking_mutex); auto [first, last] = detail::{state_name}::registry.equal_range(detail::raw_key(native)); for (auto found = first; found != last; ++found) if (found->second{parent_filter}) {{ found->second->retain(); return {name}(found->second); }} lock.unlock();"
         borrow_body = f"if (native == native_type{{}}) return std::unexpected(ResultCode::ErrorUnknown); {lookup} auto value = {borrowed_ctor};"
-        if h.name == "VkInstance":
+        if handle.c_name == "VkInstance":
             borrow_body += " volkLoadInstanceTable(&value.dispatch_, native);"
         borrow_body += " return value;"
     lines.append(
         f"inline Result<{name}> {name}::borrow(native_type native{adoption}) {{ {borrow_body} }}"
     )
     create_info_arg = ""
-    if item.create_info:
-        cpp_info = _cpp_type(item.create_info, registry, config)
+    if handle.create_info:
+        cpp_info = _cpp_type(handle.create_info, ir, config)
         create_info_arg = f", std::shared_ptr<const {cpp_info}> creationRecord"
     destroyer_type = (
         f"std::function<void({'const ' + parent + '&, ' if parent else ''}native_type)>"
     )
     offered_destroy = "destroyer(parent, native)" if parent else "destroyer(native)"
     factory_parent_arg = f", const {parent}& parent" if parent else ""
-    # makeOwned publishes a fresh, untracked native handle into a new owning
-    # block.  It performs no lookup, so create/allocate commands pay for only
-    # allocation plus association publication.
     make_lines = [
         f"inline Result<{name}> {name}::makeOwned(native_type native{factory_parent_arg}, {destroyer_type} destroyer{create_info_arg}) {{",
         "    if (!destroyer || native == native_type{}) return std::unexpected(ResultCode::ErrorUnknown);",
     ]
-    if device_scope and h.name != "VkDevice":
+    if device_scope and handle.c_name != "VkDevice":
         make_lines.extend(
             [
                 "    auto association = parent.deviceAssociation();",
@@ -3849,11 +3800,11 @@ def _emit_handle_lifetime_impl(
         )
         if parent:
             make_lines.append("    state->parent = parent;")
-        if h.name == "VkInstance":
+        if handle.c_name == "VkInstance":
             make_lines.append(
                 "    volkLoadInstanceTable(&state->instance_dispatch, native);"
             )
-        if h.name == "VkDevice":
+        if handle.c_name == "VkDevice":
             make_lines.extend(
                 [
                     "    volkLoadDeviceTable(&state->device_dispatch, native);",
@@ -3871,18 +3822,16 @@ def _emit_handle_lifetime_impl(
             f"    detail::{state_name}::registry.emplace(detail::raw_key(native), state);"
         )
     make_lines.append("    state->destroyer = std::move(destroyer);")
-    if item.create_info:
+    if handle.create_info:
         make_lines.append("    state->create_info = std::move(creationRecord);")
     make_lines.extend([f"    return {name}(state);", "}"])
     lines.append("\n".join(make_lines))
 
-    # adopt: public ownership transfer.  Reuse an existing block when the native
-    # handle is already tracked; otherwise create an owning block.
     adopt_lines = [
         f"inline Result<{name}> {name}::adopt(native_type native{adoption}, std::function<void(native_type)> destroyer{create_info_arg}) {{",
         "    if (!destroyer || native == native_type{}) return std::unexpected(ResultCode::ErrorUnknown);",
     ]
-    if device_scope and h.name != "VkDevice":
+    if device_scope and handle.c_name != "VkDevice":
         adopt_lines.extend(
             [
                 "    auto association = parent.deviceAssociation();",
@@ -3911,7 +3860,7 @@ def _emit_handle_lifetime_impl(
         adapter = f", [destroyer = std::move(destroyer)](const {parent}&, native_type value) {{ destroyer(value); }}"
     else:
         adapter = ", std::move(destroyer)"
-    adopt_record = ", std::move(creationRecord)" if item.create_info else ""
+    adopt_record = ", std::move(creationRecord)" if handle.create_info else ""
     parent_arg = ", parent" if parent else ""
     adopt_lines.append(
         f"    return makeOwned(native{parent_arg}{adapter}{adopt_record});"
@@ -3919,86 +3868,89 @@ def _emit_handle_lifetime_impl(
     adopt_lines.append("}")
     lines.append("\n".join(adopt_lines))
     if vma_resource and parent:
-        vma_destroy = "vmaDestroyBuffer" if h.name == "VkBuffer" else "vmaDestroyImage"
+        vma_destroy = "vmaDestroyBuffer" if handle.c_name == "VkBuffer" else "vmaDestroyImage"
         create_record_arg = (
-            f", std::shared_ptr<const {_cpp_type(item.create_info, registry, config)}> creationRecord"
-            if item.create_info
+            f", std::shared_ptr<const {_cpp_type(handle.create_info, ir, config)}> creationRecord"
+            if handle.create_info
             else ""
         )
         create_record_store = (
             " state->create_info = std::move(creationRecord);"
-            if item.create_info
+            if handle.create_info
             else ""
         )
         lines.append(
             f"inline Result<{name}> {name}::adoptVma(native_type native, const {parent}& parent, std::shared_ptr<void> allocatorLifetime, VmaAllocator allocator, VmaAllocation allocation, const VmaAllocationInfo& allocationInfo, const VmaAllocationCreateInfo& allocationCreateInfo{create_record_arg}) {{ if (!allocator || !allocation || native == native_type{{}}) return std::unexpected(ResultCode::ErrorUnknown); auto association = parent.deviceAssociation(); if (!association) {{ {vma_destroy}(allocator, native, allocation); return std::unexpected(ResultCode::ErrorUnknown); }} std::unique_lock lock(detail::{state_name}::tracking_mutex); std::unique_lock association_lock(*association.mutex); std::uint64_t existing{{}}; association.dispatch->vkGetPrivateData(association.device, {object_type}, detail::raw_key(native), association.slot, &existing); detail::{state_name}* state = existing ? static_cast<detail::{state_name}*>(reinterpret_cast<detail::LifetimeHeader*>(static_cast<std::uintptr_t>(existing))) : nullptr; if (state) {{ state->retain(); return {name}(state); }} state = new (std::nothrow) detail::{state_name}; if (!state) {{ association_lock.unlock(); lock.unlock(); {vma_destroy}(allocator, native, allocation); return std::unexpected(ResultCode::ErrorOutOfHostMemory); }} state->native = native; state->parent = parent; state->vma_allocator_lifetime = std::move(allocatorLifetime); state->vma_allocator = allocator; state->vma_allocation = allocation; state->vma_allocation_info = allocationInfo; state->vma_allocation_create_info = allocationCreateInfo;{create_record_store} auto status = association.dispatch->vkSetPrivateData(association.device, {object_type}, detail::raw_key(native), association.slot, static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(static_cast<detail::LifetimeHeader*>(state)))); if (status != VK_SUCCESS) {{ association_lock.unlock(); delete state; lock.unlock(); {vma_destroy}(allocator, native, allocation); return std::unexpected(static_cast<ResultCode>(status)); }} return {name}(state); }}"
         )
-    return _guard("\n".join(lines), h.protect or h.availability.protect)
+    return _guard("\n".join(lines), handle.protect or handle.availability.protect)
 
 
 def _emit_handle_implementations(
-    analysis: ApiAnalysis,
-    registry: Registry,
+    ir: IrRegistry,
     config: GeneratorConfig,
     vma_resources: frozenset[str],
 ) -> str:
     result: list[str] = []
-    for handle in analysis.handles.values():
+    for handle in ir.handles.values():
+        if not handle.active:
+            continue
         result.append(
-            _emit_handle_lifetime_impl(handle, registry, config, vma_resources)
+            _emit_handle_lifetime_impl(handle, ir, config, vma_resources)
         )
         seen: set[str] = set()
-        for command in handle.commands:
-            implementation = _method_impl(command, handle.type.name, registry, config)
+        for command in _handle_commands(handle, ir):
+            implementation = _method_impl(command, handle.name, ir, config)
             if implementation and implementation not in seen:
                 result.append(
                     _guard(
                         implementation,
-                        command.command.protect or command.command.availability.protect,
+                        command.protect or command.availability.protect,
                     )
                 )
                 seen.add(implementation)
-            convenience = _convenience_impl(command, handle.type.name, registry, config)
+            convenience = _convenience_impl(command, handle.name, ir, config)
             if convenience and convenience not in seen:
                 result.append(
                     _guard(
                         convenience,
-                        command.command.protect or command.command.availability.protect,
+                        command.protect or command.availability.protect,
                     )
                 )
                 seen.add(convenience)
             owned_convenience = _owned_handle_convenience_impl(
-                command, handle.type.name, registry, config
+                command, handle.name, ir, config
             )
             if owned_convenience and owned_convenience not in seen:
                 result.append(
                     _guard(
                         owned_convenience,
-                        command.command.protect or command.command.availability.protect,
+                        command.protect or command.availability.protect,
                     )
                 )
                 seen.add(owned_convenience)
             multi_output = _multi_output_impl(
-                command, handle.type.name, registry, config
+                command, handle.name, ir, config
             )
             if multi_output and multi_output not in seen:
                 result.append(
                     _guard(
                         multi_output,
-                        command.command.protect or command.command.availability.protect,
+                        command.protect or command.availability.protect,
                     )
                 )
                 seen.add(multi_output)
-    result.append(_emit_context_implementations(analysis, registry, config))
+    result.append(_emit_context_implementations(ir, config))
     return "\n\n".join(result)
 
 
 def _emit_handle_template_implementations(
-    analysis: ApiAnalysis, registry: Registry, config: GeneratorConfig
+    ir: IrRegistry, config: GeneratorConfig
 ) -> str:
     result: list[str] = []
-    for item in analysis.handles.values():
-        name = item.cpp_name
+    for handle in ir.handles.values():
+        if not handle.active:
+            continue
+        name = _cpp_type(handle.name, ir, config)
         definitions = [
             f"template <typename T> inline Result<void> {name}::setData(std::shared_ptr<const T> value) const {{ if (!ctrl_) return std::unexpected(ResultCode::ErrorUnknown); std::unique_lock lock(ctrl_->externsync); try {{ if (!ctrl_->data) ctrl_->data = std::make_unique<std::unordered_map<std::type_index, std::shared_ptr<const void>>>(); ctrl_->data->insert_or_assign(typeid(T), std::move(value)); }} catch (...) {{ return std::unexpected(ResultCode::ErrorOutOfHostMemory); }} return {{}}; }}",
             f"template <typename T> inline std::shared_ptr<const T> {name}::getData() const noexcept {{ if (!ctrl_) return nullptr; std::shared_lock lock(ctrl_->externsync); if (!ctrl_->data) return nullptr; auto found = ctrl_->data->find(typeid(T)); return found == ctrl_->data->end() ? nullptr : std::static_pointer_cast<const T>(found->second); }}",
@@ -4007,60 +3959,62 @@ def _emit_handle_template_implementations(
         result.append(
             _guard(
                 "\n\n".join(definitions),
-                item.type.protect or item.type.availability.protect,
+                handle.protect or handle.availability.protect,
             )
         )
     return "\n\n".join(result)
 
 
-def _emit_forwards(registry: Registry, config: GeneratorConfig) -> str:
+def _emit_forwards(ir: IrRegistry, config: GeneratorConfig) -> str:
     values = []
-    for item in registry.structs:
-        if (
-            not item.alias
-            and item.category == "struct"
-            and _has_native_definition(item)
-        ):
-            values.append(f"struct {_cpp_type(item.name, registry, config)};")
-    for item in registry.handles:
-        if not item.alias:
-            values.append(f"class {_cpp_type(item.name, registry, config)};")
-            if len(creation_infos_for_handle(registry, item)) > 1:
-                values.append(
-                    f"struct {_cpp_type(item.name, registry, config)}CreationRecord;"
-                )
+    for struct in ir.structs.values():
+        if struct.active and struct.category == "struct" and struct.members:
+            values.append(f"struct {_cpp_type(struct.name, ir, config)};")
+    for handle in ir.handles.values():
+        if not handle.active:
+            continue
+        values.append(f"class {_cpp_type(handle.name, ir, config)};")
+        alternatives = tuple(alt for alt in handle.create_infos if alt in ir.structs)
+        if len(alternatives) > 1:
+            values.append(
+                f"struct {_cpp_type(handle.name, ir, config)}CreationRecord;"
+            )
     return "\n".join(values)
 
 
-def _emit_command_result_forwards(analysis: ApiAnalysis, registry: Registry) -> str:
+def _emit_command_result_forwards(ir: IrRegistry) -> str:
     return "\n".join(
-        f"struct {_command_result_name(item)};"
-        for item in analysis.commands
-        if _has_multi_output_result(item, registry)
+        f"struct {_command_result_name(command)};"
+        for command in ir.commands.values()
+        if command.active and _has_multi_output_result(command, ir)
     )
 
 
-def _emit_extensions(registry: Registry, config: GeneratorConfig) -> str:
+def _emit_extensions(ir: IrRegistry, config: GeneratorConfig) -> str:
     lines = []
-    for item in registry.structs:
-        extension = _cpp_type(item.name, registry, config)
-        for base in item.struct_extends:
+    for struct in ir.structs.values():
+        if not struct.active:
+            continue
+        extension = _cpp_type(struct.name, ir, config)
+        for base in struct.struct_extends:
             lines.append(
-                f"template <> struct StructureExtends<{_cpp_type(base, registry, config)}, {extension}> : std::true_type {{}};"
+                f"template <> struct StructureExtends<{_cpp_type(base, ir, config)}, {extension}> : std::true_type {{}};"
             )
     return "\n".join(lines)
 
 
 def _context_method_parts(
-    item: CommandAnalysis, registry: Registry, config: GeneratorConfig
+    command: Command, ir: IrRegistry, config: GeneratorConfig
 ) -> tuple[str, str, str]:
-    return _command_parts(item, None, registry, config)
+    return _command_parts(command, None, ir, config)
 
 
-def _emit_context(
-    analysis: ApiAnalysis, registry: Registry, config: GeneratorConfig
-) -> str:
-    commands = [item for item in analysis.commands if not item.receivers]
+def _emit_context(ir: IrRegistry, config: GeneratorConfig) -> str:
+    commands = [
+        command
+        for command in ir.commands.values()
+        if command.active and not command.receivers
+    ]
     version = config.minimum_core.replace(".", "_")
     lines = [
         "// Receiver-less API owner; Context is deliberately not a handle.",
@@ -4070,17 +4024,17 @@ def _emit_context(
         f"    static constexpr std::uint32_t minimumApiVersion = VK_API_VERSION_{version};",
         "    [[nodiscard]] static Result<Context> create();",
     ]
-    for item in commands:
-        result, params, _ = _context_method_parts(item, registry, config)
+    for command in commands:
+        result, params, _ = _context_method_parts(command, ir, config)
         prefix = "" if result == "void" else "[[nodiscard]] "
-        lines.append(f"    {prefix}{result} {item.cpp_name}({params}) const;")
-        convenience = _convenience_decl(item, None, registry, config)
+        lines.append(f"    {prefix}{result} {command.cpp_name}({params}) const;")
+        convenience = _convenience_decl(command, None, ir, config)
         if convenience:
             lines.append(convenience)
-        value_convenience = _owned_handle_convenience_decl(item, None, registry, config)
+        value_convenience = _owned_handle_convenience_decl(command, None, ir, config)
         if value_convenience:
             lines.append(value_convenience)
-        multi_output = _multi_output_decl(item, None, registry, config)
+        multi_output = _multi_output_decl(command, None, ir, config)
         if multi_output:
             lines.append(multi_output)
     lines.append("};")
@@ -4088,7 +4042,7 @@ def _emit_context(
 
 
 def _emit_context_implementations(
-    analysis: ApiAnalysis, registry: Registry, config: GeneratorConfig
+    ir: IrRegistry, config: GeneratorConfig
 ) -> str:
     lines: list[str] = [
         "inline Result<Context> Context::create() {",
@@ -4098,68 +4052,75 @@ def _emit_context_implementations(
         "    return Context{};",
         "}",
     ]
-    for item in analysis.commands:
-        if item.receivers:
+    for command in ir.commands.values():
+        if not command.active or command.receivers:
             continue
-        result, params, body = _context_method_parts(item, registry, config)
+        result, params, body = _context_method_parts(command, ir, config)
         if body:
             lines.append(
                 _guard(
-                    f"inline {result} Context::{item.cpp_name}({params}) const {{ {body} }}",
-                    item.command.protect or item.command.availability.protect,
+                    f"inline {result} Context::{command.cpp_name}({params}) const {{ {body} }}",
+                    command.protect or command.availability.protect,
                 )
             )
-        convenience = _convenience_impl(item, None, registry, config)
+        convenience = _convenience_impl(command, None, ir, config)
         if convenience:
             lines.append(
                 _guard(
                     convenience,
-                    item.command.protect or item.command.availability.protect,
+                    command.protect or command.availability.protect,
                 )
             )
-        value_convenience = _owned_handle_convenience_impl(item, None, registry, config)
+        value_convenience = _owned_handle_convenience_impl(command, None, ir, config)
         if value_convenience:
             lines.append(
                 _guard(
                     value_convenience,
-                    item.command.protect or item.command.availability.protect,
+                    command.protect or command.availability.protect,
                 )
             )
-        multi_output = _multi_output_impl(item, None, registry, config)
+        multi_output = _multi_output_impl(command, None, ir, config)
         if multi_output:
             lines.append(
                 _guard(
                     multi_output,
-                    item.command.protect or item.command.availability.protect,
+                    command.protect or command.availability.protect,
                 )
             )
     return "\n\n".join(lines)
 
 
-def _emit_command_metadata(
-    analysis: ApiAnalysis, registry: Registry, config: GeneratorConfig
-) -> str:
+def _emit_command_metadata(ir: IrRegistry, config: GeneratorConfig) -> str:
     lines = [
         "// Generated multi-output records and command metadata retained for custom lowering."
     ]
-    for item in analysis.commands:
-        if not _has_multi_output_result(item, registry):
+    for command in ir.commands.values():
+        if not command.active or not _has_multi_output_result(command, ir):
             continue
-        lines.append(f"struct {_command_result_name(item)} {{")
-        for output in item.output.outputs:
-            cpp = _cpp_type(output.type, registry, config)
-            field_type = f"std::vector<{cpp}>" if output.length else cpp
+        lines.append(f"struct {_command_result_name(command)} {{")
+        for name in command.outputs:
+            output = command.param(name)
+            if output is None:
+                continue
+            cpp = _cpp_type(output.type, ir, config)
+            field_type = f"std::vector<{cpp}>" if _lengths(output) else cpp
             lines.append(f"    {field_type} {_public_param_name(output)}{{}};")
         lines.append("};")
-    for item in analysis.commands:
-        successes = ",".join(item.command.success_codes)
-        receivers = ",".join(item.receivers) or "Context"
-        outputs = ",".join(output.name for output in item.output.outputs)
+    for command in ir.commands.values():
+        if not command.active:
+            continue
+        successes = ",".join(command.success_codes)
+        receivers = ",".join(command.receivers) or "Context"
+        outputs = ",".join(command.outputs)
         lines.append(
-            f"// {item.command.name}: receivers={receivers}; success={successes}; outputs={outputs}; externsync={','.join(p.name for p in item.command.params if p.externsync)}"
+            f"// {command.c_name}: receivers={receivers}; success={successes}; outputs={outputs}; externsync={','.join(p.name for p in command.params if p.externsync)}"
         )
     return "\n".join(lines)
 
+
+# ---------------------------------------------------------------------------
+# Runtime prelude (unchanged verbatim from the previous emitter)
+# ---------------------------------------------------------------------------
 
 RUNTIME = r"""namespace detail {
 struct LifetimeHeader {
@@ -4186,6 +4147,14 @@ struct DispatchState {
     const VolkInstanceTable* instance{};
     const VolkDeviceTable* device{};
     VkDevice native_device{};
+};
+struct HandleAccess {
+    template <typename Handle>
+    [[nodiscard]] static DeviceAssociation deviceAssociation(const Handle& value) noexcept { return value.deviceAssociation(); }
+    template <typename Handle>
+    [[nodiscard]] static DispatchState dispatchState(const Handle& value) noexcept { return value.dispatchState(); }
+    template <typename Handle>
+    [[nodiscard]] static const auto& parent(const Handle& value) noexcept { return value.parent(); }
 };
 using ErrorSink = void (*)(ResultCode, std::string_view, std::uint64_t) noexcept;
 inline void default_error_sink(ResultCode, std::string_view, std::uint64_t) noexcept {}
@@ -4343,6 +4312,10 @@ class ExtensionChain {
     }
 };"""
 
+
+# ---------------------------------------------------------------------------
+# VMA (unchanged, operates on VmaModel)
+# ---------------------------------------------------------------------------
 
 def _vma_sections(vma: VmaModel | None) -> tuple[str, str]:
     if not vma:
@@ -4514,17 +4487,19 @@ def _vma_resource_types(vma: VmaModel | None) -> frozenset[str]:
     return frozenset(resources)
 
 
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
 def emit_sections(
-    registry: Registry,
+    ir: IrRegistry,
     config: GeneratorConfig,
     template: Template,
     vma: VmaModel | None = None,
 ) -> dict[str, str]:
-    analysis = analyze(registry, config)
-    known = {_cpp_type(item.name, registry, config) for item in registry.types.values()}
+    known = {_cpp_type(name, ir, config) for name in ir.type_order}
     unknown_injections = set(template.injections) - known
     if unknown_injections:
-        # render_template also checks this; fail before mutating IR with injections.
         from .template import TemplateError
 
         raise TemplateError(
@@ -4532,14 +4507,8 @@ def emit_sections(
         )
     vma_decl, vma_impl = _vma_sections(vma)
     vma_resources = _vma_resource_types(vma)
-    struct_impl = _emit_struct_implementations(registry, config)
-    handle_impl = _emit_handle_implementations(
-        analysis, registry, config, vma_resources
-    )
-    # A template containing both declarations and definitions is a
-    # header-only/module-style output and needs ODR-safe inline definitions.
-    # A definition-only template (the paired .cpp mode) emits ordinary
-    # external definitions instead.
+    struct_impl = _emit_struct_implementations(ir, config)
+    handle_impl = _emit_handle_implementations(ir, config, vma_resources)
     combined_output = (
         "{{handles}}" in template.text and "{{handle_implementations}}" in template.text
     )
@@ -4554,27 +4523,25 @@ def emit_sections(
         "includes": "#include <volk.h>\n"
         + (f"#include <{config.vma_include}>\n" if vma else "")
         + "#include <algorithm>\n#include <array>\n#include <atomic>\n#include <cstdint>\n#include <cstring>\n#include <expected>\n#include <functional>\n#include <limits>\n#include <memory>\n#include <mutex>\n#include <new>\n#include <optional>\n#include <ranges>\n#include <shared_mutex>\n#include <span>\n#include <string>\n#include <string_view>\n#include <typeindex>\n#include <type_traits>\n#include <unordered_map>\n#include <utility>\n#include <variant>\n#include <vector>",
-        "forward_declarations": _emit_forwards(registry, config)
+        "forward_declarations": _emit_forwards(ir, config)
         + "\n"
-        + _emit_command_result_forwards(analysis, registry),
-        "result_code": _emit_result_code(registry),
-        "aliases": _emit_aliases(registry, config),
-        "constants": _emit_constants(registry),
-        "enums": _emit_enums(registry, config),
+        + _emit_command_result_forwards(ir),
+        "result_code": _emit_result_code(ir),
+        "aliases": _emit_aliases(ir, config),
+        "constants": _emit_constants(ir),
+        "enums": _emit_enums(ir, config),
         "runtime_declarations": PRELUDE + "\n" + RUNTIME,
         "runtime_implementations": "",
-        "structure_extensions": _emit_extensions(registry, config),
-        "structs": _emit_structs(registry, config, template),
-        "handles": _emit_handles(analysis, registry, config, template, vma_resources),
+        "structure_extensions": _emit_extensions(ir, config),
+        "structs": _emit_structs(ir, config, template),
+        "handles": _emit_handles(ir, config, template, vma_resources),
         "context": "",
-        "command_declarations": _emit_command_metadata(analysis, registry, config),
+        "command_declarations": _emit_command_metadata(ir, config),
         "command_implementations": "",
         "struct_implementations": struct_impl,
         "struct_template_implementations": "",
         "handle_implementations": handle_impl,
-        "handle_template_implementations": _emit_handle_template_implementations(
-            analysis, registry, config
-        ),
+        "handle_template_implementations": _emit_handle_template_implementations(ir, config),
         "command_template_implementations": "",
         "vma_declarations": vma_decl,
         "vma_implementations": vma_impl,

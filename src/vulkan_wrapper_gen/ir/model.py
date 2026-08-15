@@ -1,4 +1,4 @@
-﻿"""Middle-layer IR model for the Vulkan wrapper generator.
+"""Middle-layer IR model for the Vulkan wrapper generator.
 
 The IR is a processed, registry-neutral representation of Khronos registry XML
 input (vk.xml, video.xml, ...).  Compared to the raw XML it:
@@ -578,6 +578,7 @@ class Basetype:
     doc: str | None = None
     protect: str | None = None
     availability: Availability = field(default_factory=Availability)
+    active: bool = True
 
     @property
     def c_declaration(self) -> str:
@@ -592,6 +593,7 @@ class Basetype:
             "doc": self.doc,
             "protect": self.protect,
             "availability": self.availability.to_dict(),
+            "active": self.active,
         }
 
     @classmethod
@@ -603,6 +605,7 @@ class Basetype:
             doc=data.get("doc"),
             protect=data.get("protect"),
             availability=Availability.from_dict(data.get("availability", {})),
+            active=bool(data.get("active", True)),
         )
 
 
@@ -623,6 +626,7 @@ class FuncPointer:
     doc: str | None = None
     protect: str | None = None
     availability: Availability = field(default_factory=Availability)
+    active: bool = True
 
     @property
     def c_declaration(self) -> str:
@@ -644,6 +648,7 @@ class FuncPointer:
             "doc": self.doc,
             "protect": self.protect,
             "availability": self.availability.to_dict(),
+            "active": self.active,
         }
 
     @classmethod
@@ -657,6 +662,7 @@ class FuncPointer:
             doc=data.get("doc"),
             protect=data.get("protect"),
             availability=Availability.from_dict(data.get("availability", {})),
+            active=bool(data.get("active", True)),
         )
 
 
@@ -719,6 +725,7 @@ class Define:
     disabled: bool = False
     doc: str | None = None
     protect: str | None = None
+    active: bool = True
 
     @property
     def c_declaration(self) -> str:
@@ -735,6 +742,7 @@ class Define:
             "disabled": self.disabled,
             "doc": self.doc,
             "protect": self.protect,
+            "active": self.active,
         }
 
     @classmethod
@@ -747,6 +755,7 @@ class Define:
             disabled=bool(data.get("disabled", False)),
             doc=data.get("doc"),
             protect=data.get("protect"),
+            active=bool(data.get("active", True)),
         )
 
 
@@ -768,6 +777,7 @@ class RawType:
     doc: str | None = None
     protect: str | None = None
     availability: Availability = field(default_factory=Availability)
+    active: bool = True
 
     @property
     def c_declaration(self) -> str:
@@ -786,6 +796,7 @@ class RawType:
             "doc": self.doc,
             "protect": self.protect,
             "availability": self.availability.to_dict(),
+            "active": self.active,
         }
 
     @classmethod
@@ -799,6 +810,7 @@ class RawType:
             doc=data.get("doc"),
             protect=data.get("protect"),
             availability=Availability.from_dict(data.get("availability", {})),
+            active=bool(data.get("active", True)),
         )
 
 
@@ -860,9 +872,9 @@ class Command:
     processed type name (``Result``) with ``c_return_type`` keeping the C
     spelling (``VkResult``).  The C signature is never stored:
     :attr:`c_signature` reconstructs it from those fields and the processed
-    parameters.  ``receivers`` / ``member_names`` record who holds the
-    command as a member function and under which receiver-relative name,
-    using general handle names.
+    parameters.  ``receivers`` / ``member_name`` record who holds the command
+    as a member function and the name it takes on that wrapper (``cpp_name``
+    for receiver-less Context commands), using general handle names.
     """
 
     name: str
@@ -886,8 +898,8 @@ class Command:
     # Computed during IR construction:
     cpp_name: str = ""                          # receiver-independent C++ name
     dispatch: str | None = None                 # first handle param (VkDevice/...)
-    receivers: tuple[str, ...] = ()             # handle types hosting this command
-    member_names: dict[str, str] = field(default_factory=dict)
+    receivers: tuple[str, ...] = ()             # handle type hosting this command
+    member_name: str = ""                       # name on its wrapper (or Context)
     outputs: tuple[str, ...] = ()               # writable output param names
     count_param: str | None = None              # two-call enumeration count param
     vector_output: str | None = None            # two-call enumeration vector param
@@ -928,7 +940,7 @@ class Command:
             "cpp_name": self.cpp_name,
             "dispatch": self.dispatch,
             "receivers": list(self.receivers),
-            "member_names": dict(self.member_names),
+            "member_name": self.member_name,
             "outputs": list(self.outputs),
             "count_param": self.count_param,
             "vector_output": self.vector_output,
@@ -961,7 +973,7 @@ class Command:
             cpp_name=data.get("cpp_name", ""),
             dispatch=data.get("dispatch"),
             receivers=tuple(data.get("receivers", ())),
-            member_names=dict(data.get("member_names", {})),
+            member_name=data.get("member_name", ""),
             outputs=tuple(data.get("outputs", ())),
             count_param=data.get("count_param"),
             vector_output=data.get("vector_output"),
@@ -984,6 +996,7 @@ class IrRegistry:
     tags: tuple[str, ...] = ()
     platforms: dict[str, str] = field(default_factory=dict)
     header_version: str | None = None
+    type_order: tuple[str, ...] = ()
     handles: dict[str, Handle] = field(default_factory=dict)
     structs: dict[str, Struct] = field(default_factory=dict)
     enums: dict[str, Enum] = field(default_factory=dict)
@@ -1060,6 +1073,7 @@ class IrRegistry:
             "tags": list(self.tags),
             "platforms": dict(self.platforms),
             "header_version": self.header_version,
+            "type_order": list(self.type_order),
             "handles": {name: value.to_dict() for name, value in self.handles.items()},
             "structs": {name: value.to_dict() for name, value in self.structs.items()},
             "enums": {name: value.to_dict() for name, value in self.enums.items()},
@@ -1081,6 +1095,7 @@ class IrRegistry:
             tags=tuple(data.get("tags", ())),
             platforms=dict(data.get("platforms", {})),
             header_version=data.get("header_version"),
+            type_order=tuple(data.get("type_order", ())),
             handles={name: Handle.from_dict(value) for name, value in data.get("handles", {}).items()},
             structs={name: Struct.from_dict(value) for name, value in data.get("structs", {}).items()},
             enums={name: Enum.from_dict(value) for name, value in data.get("enums", {}).items()},

@@ -344,7 +344,8 @@ int main() {
     auto all_physical = instance->enumeratePhysicalDevices();
     assert(all_physical.status == vk::ResultCode::Success);
     assert(all_physical.value.size() == 2 && enumerate_calls == 4);
-    assert(all_physical.value[0].parent().sameNativeHandle(*instance));
+    // parent()/dispatchState()/deviceAssociation() are private plumbing now;
+    // parent linkage is exercised through the borrow/adopt and teardown paths.
     enumerate_calls = 0;
     enumerate_force_retry = false;
     auto limited_physical = instance->enumeratePhysicalDevices(1);

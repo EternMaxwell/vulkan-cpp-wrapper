@@ -1,4 +1,4 @@
-﻿"""Tests for the middle-layer IR built from registry XML."""
+"""Tests for the middle-layer IR built from registry XML."""
 
 from __future__ import annotations
 
@@ -113,14 +113,14 @@ def test_double_pointer_geometry_member_keeps_dimensions():
     assert geometries.optional == ("true", "false")
 
 
-def test_command_receivers_member_names_and_c_signature():
+def test_command_receivers_member_name_and_c_signature():
     registry = _build()
     submit = registry.commands["queueSubmit"]
     assert submit.dispatch == "Queue"
     # Optional scalar handles (the fence) are synchronization arguments, not
     # receivers, unless configuration explicitly adds them.
     assert submit.receivers == ("Queue",)
-    assert submit.member_names == {"Queue": "submit"}
+    assert submit.member_name == "submit"
     assert submit.c_signature == (
         "VkResult vkQueueSubmit(VkQueue queue, uint32_t submitCount, "
         "const VkSubmitInfo* pSubmits, VkFence fence)"
@@ -134,7 +134,7 @@ def test_command_receivers_member_names_and_c_signature():
 
     wait_idle = registry.commands["deviceWaitIdle"]
     assert wait_idle.receivers == ("Device",)
-    assert wait_idle.member_names["Device"] == "waitIdle"
+    assert wait_idle.member_name == "waitIdle"
 
     create = registry.commands["createBuffer"]
     assert create.c_signature == (
@@ -213,7 +213,7 @@ def test_json_roundtrip_is_lossless():
     restored = IrRegistry.from_json(text)
     assert restored.to_dict() == registry.to_dict()
     # Sanity: the round-tripped IR still answers the same questions.
-    assert restored.commands["queueSubmit"].member_names == {"Queue": "submit"}
+    assert restored.commands["queueSubmit"].member_name == "submit"
     assert restored.commands["createBuffer"].c_signature == registry.commands["createBuffer"].c_signature
     assert restored.handles["Buffer"].releaser == "destroyBuffer"
 
@@ -244,7 +244,7 @@ def test_full_registry_builds_and_survives_roundtrip():
     assert registry.handles
     assert registry.commands
     assert registry.commands["createGraphicsPipelines"].param("pipelineCache").is_optional
-    assert registry.commands["queueSubmit"].member_names["Queue"] == "submit"
+    assert registry.commands["queueSubmit"].member_name == "submit"
     # Full-registry general names reconstruct their C spellings exactly.
     assert registry.structs["DeviceGroupPresentCapabilitiesKHR"].c_name == "VkDeviceGroupPresentCapabilitiesKHR"
     assert registry.commands["createBuffer"].c_name == "vkCreateBuffer"

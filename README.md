@@ -58,8 +58,12 @@ Fallible detach/destruction is reported through `setDestructionErrorSink`; destr
 ## Middle-layer IR
 
 Registry XML is first transformed into a processed, JSON-serializable
-middle-layer IR (`vulkan_wrapper_gen.ir`).  The IR normalizes everything the
-XML leaves implicit while keeping every raw attribute and doc comment:
+middle-layer IR (`vulkan_wrapper_gen.ir`).  The IR is the generator's single
+source of truth: `build_ir` produces it and the C++ emitter consumes it
+directly, so receivers, member names, output shapes, creation records and
+releasers are read from the IR rather than re-derived from XML.  The IR
+normalizes everything the XML leaves implicit while keeping every raw
+attribute and doc comment:
 
 - arrays: every `len`/`altlen` reference is resolved to the count parameter it
   sizes (`counts_for`) and back (`lengths`, `is_array`, `is_byte_array`);

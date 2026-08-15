@@ -3,7 +3,7 @@ from pathlib import Path
 from vulkan_wrapper_gen.cli import run
 from vulkan_wrapper_gen.config import GeneratorConfig
 from vulkan_wrapper_gen.emitter import _cpp_type
-from vulkan_wrapper_gen.model import EnumGroup, Registry
+from vulkan_wrapper_gen.ir.model import Enum, IrRegistry
 from vulkan_wrapper_gen.naming import enum_name
 
 ROOT = Path(__file__).parents[1]
@@ -21,10 +21,8 @@ def test_flag_bit_enumerator_names_drop_group_prefix_and_bit_suffix():
 
 
 def test_enum_group_without_type_declaration_still_uses_cpp_name():
-    registry = Registry(
-        sources=(), enums={"VkFaultLevel": EnumGroup("VkFaultLevel", "enum")}
-    )
-    assert _cpp_type("VkFaultLevel", registry, GeneratorConfig()) == "FaultLevel"
+    ir = IrRegistry(enums={"FaultLevel": Enum("FaultLevel", "VkFaultLevel", "enum")})
+    assert _cpp_type("FaultLevel", ir, GeneratorConfig()) == "FaultLevel"
 
 
 def test_supplemental_structs_deep_own_nested_pointers(tmp_path):
@@ -425,7 +423,7 @@ def test_header_only_generation_is_deterministic(tmp_path):
     )
     assert "Device::enumerateBuffersEXT(std::uint32_t bufferCount) const {" in first
     assert (
-        "Result<void> createGraphicsPipelines(const std::optional<PipelineCache>& pipelineCache, std::span<const GraphicsPipelineCreateInfo> createInfos, std::optional<std::reference_wrapper<const AllocationCallbacks>> allocator, std::span<Pipeline> pipelines) const;"
+        "Result<void> createGraphicsPipelines(const PipelineCache& pipelineCache, std::span<const GraphicsPipelineCreateInfo> createInfos, std::optional<std::reference_wrapper<const AllocationCallbacks>> allocator, std::span<Pipeline> pipelines) const;"
         in first
     )
     assert "createGraphicsPipelines(VkPipelineCache" not in first
@@ -434,7 +432,7 @@ def test_header_only_generation_is_deterministic(tmp_path):
     queue = first[first.index("class Queue {") :]
     queue = queue[: queue.index("\n};")]
     assert (
-        "Result<void> submit(std::span<const SubmitInfo> submits, const std::optional<Fence>& fence) const;"
+        "Result<void> submit(std::span<const SubmitInfo> submits, const Fence& fence) const;"
         in queue
     )
     assert "queueSubmit(" not in queue

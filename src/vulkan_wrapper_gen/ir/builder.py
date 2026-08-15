@@ -1,4 +1,4 @@
-﻿"""Build the processed IR (:mod:`vulkan_wrapper_gen.ir.model`) from Khronos
+"""Build the processed IR (:mod:`vulkan_wrapper_gen.ir.model`) from Khronos
 registry XML files.
 
 The builder performs all registry-specific normalization:
@@ -29,7 +29,6 @@ import xml.etree.ElementTree as ET
 
 from ..config import GeneratorConfig
 from ..naming import strip_vk, strip_vk_command
-from ..registry import RegistryError
 from .model import (
     Alias,
     Availability,
@@ -48,6 +47,10 @@ from .model import (
     RawType,
     Struct,
 )
+
+
+class RegistryError(ValueError):
+    """Raised when registry XML input is missing, malformed, or conflicting."""
 
 
 def _csv(value: str | None) -> tuple[str, ...]:
@@ -289,6 +292,10 @@ def _selected_extension(name: str, include: tuple[str, ...], exclude: tuple[str,
     )
 
 
+def _excluded(name: str, patterns: tuple[str, ...]) -> bool:
+    return any(fnmatch.fnmatchcase(name, pattern) for pattern in patterns)
+
+
 def _receiver_member_name(cpp_name: str, receiver: str, config: GeneratorConfig) -> str:
     """Receiver-relative member name.
 
@@ -326,6 +333,7 @@ def build_ir(
     registry = IrRegistry(sources=resolved, api=api)
     roots: list[ET.Element] = []
     tags: list[str] = []
+    type_order: list[str] = []
     pending_struct_members: dict[str, list[ET.Element]] = {}
     for path in resolved:
         if not path.is_file():
@@ -358,6 +366,8 @@ def build_ir(
             protect = element.get("protect")
             alias = element.get("alias")
             gname = _generalize(name)
+            if gname not in type_order:
+                type_order.append(gname)
             if alias:
                 _add_unique(
                     registry.aliases, gname,
@@ -512,6 +522,7 @@ def build_ir(
                     Constant(name, name, value.value, value.alias_of, enum_element.get("type"), value.doc, value.protect),
                 )
     registry.tags = tuple(dict.fromkeys(tags))
+    registry.type_order = tuple(type_order)
 
     # Parse struct members now that the complete handle set is known.
     handle_names = frozenset(registry.handles)
@@ -678,7 +689,18 @@ def _apply_activity(
                 target = active if extension_active and _applies(require, api) else inactive
                 target.update(child.get("name", "") for child in require if child.get("name"))
     remove = {_generalize(name) for name in inactive - active}
-    for collection in (registry.handles, registry.structs, registry.bitmasks, registry.aliases, registry.commands, registry.constants):
+    for collection in (
+        registry.handles,
+        registry.structs,
+        registry.bitmasks,
+        registry.aliases,
+        registry.commands,
+        registry.constants,
+        registry.basetypes,
+        registry.func_pointers,
+        registry.defines,
+        registry.raw_types,
+    ):
         for name, item in collection.items():
             if name in remove:
                 item.active = False
@@ -705,7 +727,7 @@ def _release_target(command: Command, handle_names: frozenset[str]) -> str | Non
     return handles[-1].type if len(handles) >= 2 else None
 
 
-def _handle_releasers(registry: IrRegistry) -> dict[str, str]:
+def _handle_releasers(registry: IrRegistry, handle_names: frozenset[str]) -> dict[str, str]:
     result: dict[str, str] = {}
     rank = ("destroy", "free", "release")
 
@@ -716,9 +738,9 @@ def _handle_releasers(registry: IrRegistry) -> dict[str, str]:
         )
 
     for command in registry.commands.values():
-        if command.alias_of:
+        if not command.active or command.alias_of:
             continue
-        target = _release_target(command, registry.handle_names)
+        target = _release_target(command, handle_names)
         if target is None:
             continue
         previous = result.get(target)
@@ -730,7 +752,11 @@ def _handle_releasers(registry: IrRegistry) -> dict[str, str]:
 def _creation_infos_for_handle(registry: IrRegistry, handle: Handle) -> tuple[str, ...]:
     candidates: list[str] = []
     for command in registry.commands.values():
-        if command.alias_of or not command.c_name.startswith(("vkCreate", "vkAllocate")):
+        if (
+            not command.active
+            or command.alias_of
+            or not command.c_name.startswith(("vkCreate", "vkAllocate"))
+        ):
             continue
         output = [param for param in command.params if param.type == handle.name and param.direction == "output"]
         if not output:
@@ -750,6 +776,18 @@ def _creation_infos_for_handle(registry: IrRegistry, handle: Handle) -> tuple[st
 def _finalize(registry: IrRegistry, config: GeneratorConfig) -> None:
     """Compute all derived relationships once parsing has completed."""
     handle_names = registry.handle_names
+
+    # Config-driven exclusion: excluded commands and handle types are marked
+    # inactive so they neither emit wrappers nor host/receive commands.
+    for command in registry.commands.values():
+        if _excluded(command.c_name, config.exclude_commands):
+            command.active = False
+    for handle in registry.handles.values():
+        if _excluded(handle.c_name, config.exclude_types):
+            handle.active = False
+    active_handles = frozenset(
+        handle.name for handle in registry.handles.values() if handle.active
+    )
 
     # Alias resolution.
     for alias in registry.aliases.values():
@@ -779,8 +817,10 @@ def _finalize(registry: IrRegistry, config: GeneratorConfig) -> None:
             command.command_buffer_levels = target.command_buffer_levels
             command.tasks = target.tasks
 
-    releasers = _handle_releasers(registry)
+    releasers = _handle_releasers(registry, active_handles)
     for handle in registry.handles.values():
+        if not handle.active:
+            continue
         handle.create_infos = _creation_infos_for_handle(registry, handle)
         handle.releaser = releasers.get(handle.name)
         if len(handle.create_infos) == 1:
@@ -788,28 +828,29 @@ def _finalize(registry: IrRegistry, config: GeneratorConfig) -> None:
         elif handle.create_infos:
             handle.create_info = f"{handle.name}CreationRecord"
 
+    # Lifetime endpoints (Destroy/Free/Release that release a handle, including
+    # their aliases) are consumed by the owning handle's control-block deleter;
+    # they are never emitted as public methods.
+    for command in registry.commands.values():
+        if command.active and _release_target(command, active_handles) is not None:
+            command.active = False
+
     overrides = config.receivers
     for command in registry.commands.values():
-        if command.alias_of:
+        if not command.active:
             continue
         # Dispatch handle: the first handle-typed parameter.
         command.dispatch = (
             command.params[0].type
-            if command.params and command.params[0].type in handle_names
+            if command.params and command.params[0].type in active_handles
             else None
         )
-        # Receivers: dispatch handle first, then required scalar handles.
+        # Receivers: only the dispatch handle.  Each command lives in exactly
+        # one wrapper (or Context when receiver-less); additional homes are
+        # requested explicitly through the receivers configuration.
         receivers: list[str] = []
         if command.dispatch:
             receivers.append(command.dispatch)
-        for param in command.params:
-            if (
-                param.type in handle_names
-                and param.pointer_depth == 0
-                and not param.is_optional
-                and param.type not in receivers
-            ):
-                receivers.append(param.type)
         override = overrides.get(command.c_name)
         if override:
             receivers = [value for value in receivers if value not in override.remove]
@@ -820,13 +861,16 @@ def _finalize(registry: IrRegistry, config: GeneratorConfig) -> None:
             or config.command_names.get(command.c_name)
             or strip_vk_command(command.c_name)
         )
-        for receiver in receivers:
-            member = command.cpp_name
+        # A command lives in exactly one place, so it has a single member name:
+        # the receiver-relative name for handle commands, cpp_name for Context.
+        member = command.cpp_name
+        if receivers:
+            receiver = receivers[0]
             if not ((override and override.rename) or command.c_name in config.command_names):
                 member = _receiver_member_name(member, receiver, config)
             if receiver == "CommandBuffer" and member.startswith("cmd") and len(member) > 3:
                 member = member[3].lower() + member[4:]
-            command.member_names[receiver] = member
+        command.member_name = member
 
         # Outputs and two-call enumeration shape.
         outputs = tuple(

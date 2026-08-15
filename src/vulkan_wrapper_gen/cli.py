@@ -6,9 +6,8 @@ import sys
 
 from .config import ConfigError, load_config
 from .emitter import emit_sections
-from .ir import build_ir
-from .naming import strip_vk, strip_vk_command
-from .registry import RegistryError, parse_registries
+from .ir import RegistryError, build_ir
+from .naming import strip_vk
 from .template import TemplateError, atomic_write, load_template, render_template
 from .vma import VmaError, parse_vma_header
 
@@ -73,34 +72,35 @@ def run(arguments: list[str] | None = None) -> int:
     duplicates = sorted({str(path) for path in resolved_outputs if resolved_outputs.count(path) > 1})
     if duplicates:
         raise TemplateError(f"duplicate output paths: {', '.join(duplicates)}")
-    registry = parse_registries(
+    ir = build_ir(
         args.registry,
         config.api,
         config.include_extensions,
         config.exclude_extensions,
+        config,
     )
+    known_commands = {command.c_name for command in ir.commands.values()}
     for command, override in config.receivers.items():
-        if command not in registry.commands:
+        if command not in known_commands and command not in ir.commands:
             raise ConfigError(f"receivers names unknown command {command}")
         for receiver in (*override.add, *override.remove):
-            item = registry.types.get(receiver)
-            if item is None or item.category != "handle":
+            if ir.type_category(strip_vk(receiver)) != "handle":
                 raise ConfigError(f"receivers.{command} names unknown handle type {receiver}")
     for type_name in config.type_names:
-        if type_name not in registry.types:
+        if ir.resolve(strip_vk(type_name)) is None:
             raise ConfigError(f"naming.types names unknown type {type_name}")
     for command_name in config.command_names:
-        if command_name not in registry.commands:
+        if command_name not in known_commands and command_name not in ir.commands:
             raise ConfigError(f"naming.commands names unknown command {command_name}")
     vma = parse_vma_header(args.vma_header, tuple(args.clang_arg), config.vma_functions) if args.vma_header else None
-    known_types = {name.removeprefix("Vk") for name in registry.types} | set(config.type_names.values())
+    known_types = set(ir.type_order) | set(config.type_names.values())
     rendered_outputs: list[tuple[Path, str]] = []
     # Validate every template before replacing any output. Individual file
     # replacement is atomic; a malformed later template cannot partially
     # update an otherwise paired invocation.
     for template_path, output_path in zip(args.template, args.output, strict=True):
         template = load_template(template_path)
-        sections = emit_sections(registry, config, template, vma)
+        sections = emit_sections(ir, config, template, vma)
         rendered_outputs.append((output_path, render_template(template, sections, known_types)))
     changed = False
     for output_path, generated in rendered_outputs:
