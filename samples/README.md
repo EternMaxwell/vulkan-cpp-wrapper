@@ -48,6 +48,10 @@ cmake --build samples/build
   metadata), and a raw allocation + `AllocationView::map`/`unmap` round-trip.
   Uses a separate VMA-enabled wrapper (`vulkan_wrapper_vma.hpp`) so the other
   samples carry no VMA dependency. No shaders.
+- `08-allocator` — custom `VkAllocationCallbacks` (the multi-callback,
+  one-userdata case) provided as capturing lambdas; creates a buffer through a
+  correct aligned allocator and asserts the driver actually invokes the
+  allocation and free callbacks. No shaders.
 
 ## Notes / known limitations
 

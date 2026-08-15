@@ -225,3 +225,9 @@ add_executable(vma 07-vma/main.cpp)
 wrapper_sample(vma)
 target_include_directories(vma PRIVATE ${vma_SOURCE_DIR}/include)
 add_dependencies(vma generate_wrapper_vma)
+
+# ---------------------------------------------------------------------------
+# 08-allocator: custom allocation callbacks round-trip; no shaders, always builds.
+# ---------------------------------------------------------------------------
+add_executable(allocator 08-allocator/main.cpp)
+wrapper_sample(allocator)

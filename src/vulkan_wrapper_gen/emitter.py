@@ -1135,7 +1135,9 @@ def _emit_struct_impl(
             continue
         if member.name in callback_members:
             cb_field = _callback_field_name(member)
-            lines.append(f"    {target} = {name}_{cb_field}_trampoline;")
+            lines.append(
+                f"    {target} = callbacks_ && callbacks_->{cb_field} ? {name}_{cb_field}_trampoline : nullptr;"
+            )
             continue
         if member.name == "pNext":
             lines.append(

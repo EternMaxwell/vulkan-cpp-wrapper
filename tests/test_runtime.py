@@ -843,6 +843,32 @@ int main() {
         VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT,
         nullptr, callback_native.value.pUserData);
     assert(callback_calls == 2 && result == VK_TRUE);
+
+    // Multi-callback struct sharing one pUserData (VkAllocationCallbacks):
+    // userdata sits first in the native signature, returns differ, and every
+    // trampoline routes to its own callable in the shared bundle.
+    vk::AllocationCallbacks alloc_callbacks{};
+    int alloc_calls = 0;
+    int free_calls = 0;
+    auto* alloc_result = reinterpret_cast<void*>(0xdead);
+    alloc_callbacks.setAllocation([&](size_t size, size_t alignment, VkSystemAllocationScope scope) -> void* {
+        assert(size == 64 && alignment == 8 && scope == VK_SYSTEM_ALLOCATION_SCOPE_COMMAND);
+        ++alloc_calls;
+        return alloc_result;
+    });
+    alloc_callbacks.setFree([&](void* memory) {
+        assert(memory == alloc_result);
+        ++free_calls;
+    });
+    vk::AllocationCallbacks::CStruct alloc_native{};
+    alloc_callbacks.to_cstruct(&alloc_native);
+    assert(alloc_native.value.pUserData != nullptr);
+    assert(alloc_native.value.pfnAllocation != nullptr && alloc_native.value.pfnFree != nullptr);
+    auto* memory = alloc_native.value.pfnAllocation(
+        alloc_native.value.pUserData, 64, 8, VK_SYSTEM_ALLOCATION_SCOPE_COMMAND);
+    assert(memory == alloc_result && alloc_calls == 1);
+    alloc_native.value.pfnFree(alloc_native.value.pUserData, alloc_result);
+    assert(free_calls == 1);
 }
 """,
         encoding="utf-8",

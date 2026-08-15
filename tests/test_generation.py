@@ -245,8 +245,118 @@ def test_callback_members_become_refcounted_callables(tmp_path):
     assert "static_cast<CallbackStruct::Callbacks*>(pUserData)" in trampoline
     to_cstruct = generated[generated.index("inline void CallbackStruct::to_cstruct") :]
     to_cstruct = to_cstruct[: to_cstruct.index("\n}")]
-    assert "output->value.pfnCallback = CallbackStruct_callback_trampoline;" in to_cstruct
+    assert (
+        "output->value.pfnCallback = callbacks_ && callbacks_->callback ? CallbackStruct_callback_trampoline : nullptr;"
+        in to_cstruct
+    )
     assert "output->value.pUserData = callbacks_ ? callbacks_.get() : nullptr;" in to_cstruct
+
+
+def test_multi_callback_struct_shares_one_userdata_carrier(tmp_path):
+    # VkAllocationCallbacks-like: several callbacks share one pUserData, with
+    # the userdata in different parameter positions and different return types.
+    # A funcpointer without a userdata carrier stays a raw field.
+    supplemental = tmp_path / "callbacks_multi.xml"
+    supplemental.write_text(
+        """<registry><types>
+      <type category="funcpointer">
+        <proto><type>void</type>* <name>PFN_vkAllocLike</name></proto>
+        <param><type>void</type>* <name>pUserData</name></param>
+        <param><type>size_t</type> <name>size</name></param>
+        <param><type>size_t</type> <name>alignment</name></param>
+      </type>
+      <type category="funcpointer">
+        <proto><type>void</type> <name>PFN_vkFreeLike</name></proto>
+        <param><type>void</type>* <name>pUserData</name></param>
+        <param><type>uint32_t</type> <name>handle</name></param>
+      </type>
+      <type category="funcpointer">
+        <proto><type>VkBool32</type> <name>PFN_vkNotifyLike</name></proto>
+        <param><type>uint32_t</type> <name>flags</name></param>
+        <param><type>void</type>* <name>pUserData</name></param>
+      </type>
+      <type category="struct" name="VkMultiCallbackStruct">
+        <member><type>uint32_t</type> <name>valueCount</name></member>
+        <member optional="true"><type>void</type>* <name>pUserData</name></member>
+        <member><type>PFN_vkAllocLike</type> <name>pfnAlloc</name></member>
+        <member><type>PFN_vkFreeLike</type> <name>pfnFree</name></member>
+        <member><type>PFN_vkNotifyLike</type> <name>pfnNotify</name></member>
+      </type>
+      <type category="funcpointer">
+        <proto><type>void</type> <name>PFN_vkPlainSlot</name></proto>
+        <param><type>uint32_t</type> <name>value</name></param>
+      </type>
+      <type category="struct" name="VkPlainFuncPtrStruct">
+        <member><type>PFN_vkPlainSlot</type> <name>pfnSlot</name></member>
+      </type>
+    </types></registry>""",
+        encoding="utf-8",
+    )
+    output = tmp_path / "wrapper.hpp"
+    assert (
+        run(
+            [
+                "--registry",
+                str(FIXTURE),
+                "--registry",
+                str(supplemental),
+                "--emit", str(ROOT / "templates" / "vulkan-header-only.template.hpp") + ":" + str(output),
+            ]
+        )
+        == 0
+    )
+    generated = output.read_text(encoding="utf-8")
+    body = generated[generated.index("struct MultiCallbackStruct {") :]
+    body = body[: body.index("\n};")]
+    assert "struct Callbacks {" in body
+    assert "std::function<void*(size_t, size_t)> alloc{};" in body
+    assert "std::function<void(uint32_t)> free{};" in body
+    assert "std::function<VkBool32(uint32_t)> notify{};" in body
+    assert "std::shared_ptr<Callbacks> callbacks_{};" in body
+    assert "setAlloc(std::function<void*(size_t, size_t)> value)" in body
+    assert "setFree(std::function<void(uint32_t)> value)" in body
+    assert "setNotify(std::function<VkBool32(uint32_t)> value)" in body
+    assert "pUserData{}" not in body
+    assert "pfnAlloc{}" not in body
+    assert "pfnFree{}" not in body
+    assert "pfnNotify{}" not in body
+    # userdata-first callback (void* return) drops pUserData from position 0.
+    alloc_tramp = generated[
+        generated.index("MultiCallbackStruct_alloc_trampoline") :
+    ]
+    assert (
+        "if (callbacks && callbacks->alloc) return callbacks->alloc(size, alignment);"
+        in alloc_tramp
+    )
+    # userdata-last callback drops pUserData from the tail.
+    notify_tramp = generated[
+        generated.index("MultiCallbackStruct_notify_trampoline") :
+    ]
+    assert (
+        "if (callbacks && callbacks->notify) return callbacks->notify(flags);"
+        in notify_tramp
+    )
+    to_cstruct = generated[generated.index("inline void MultiCallbackStruct::to_cstruct") :]
+    to_cstruct = to_cstruct[: to_cstruct.index("\n}")]
+    assert (
+        "output->value.pfnAlloc = callbacks_ && callbacks_->alloc ? MultiCallbackStruct_alloc_trampoline : nullptr;"
+        in to_cstruct
+    )
+    assert (
+        "output->value.pfnFree = callbacks_ && callbacks_->free ? MultiCallbackStruct_free_trampoline : nullptr;"
+        in to_cstruct
+    )
+    assert (
+        "output->value.pfnNotify = callbacks_ && callbacks_->notify ? MultiCallbackStruct_notify_trampoline : nullptr;"
+        in to_cstruct
+    )
+    assert "output->value.pUserData = callbacks_ ? callbacks_.get() : nullptr;" in to_cstruct
+    # A funcpointer with no userdata carrier stays a plain raw field.
+    plain = generated[generated.index("struct PlainFuncPtrStruct {") :]
+    plain = plain[: plain.index("\n};")]
+    assert "struct Callbacks" not in plain
+    assert "PFN_vkPlainSlot pfnSlot{};" in plain
+    assert "setPfnSlot(PFN_vkPlainSlot value)" in plain
 
 
 def test_shared_command_counts_never_exceed_span_storage(tmp_path):
