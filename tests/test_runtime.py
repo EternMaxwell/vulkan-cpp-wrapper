@@ -91,6 +91,8 @@ static int create_device_calls = 0;
 static int generated_device_destroys = 0;
 static bool create_device_saw_private_feature = false;
 static bool create_device_saw_slot_request = false;
+static bool create_device_saw_vulkan13_private = false;
+static bool create_device_saw_private_data_features = false;
 static bool enumerate_force_retry = false;
 static int enumerate_calls = 0;
 static std::atomic_int queue_submit_active{0};
@@ -168,10 +170,17 @@ VKAPI_ATTR VkResult VKAPI_CALL fake_create_device(
     ++create_device_calls;
     create_device_saw_private_feature = false;
     create_device_saw_slot_request = false;
+    create_device_saw_vulkan13_private = false;
+    create_device_saw_private_data_features = false;
     for (auto* node = static_cast<const VkBaseInStructure*>(info->pNext); node; node = node->pNext) {
         if (node->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRIVATE_DATA_FEATURES) {
             create_device_saw_private_feature =
                 reinterpret_cast<const VkPhysicalDevicePrivateDataFeatures*>(node)->privateData == VK_TRUE;
+            create_device_saw_private_data_features = true;
+        }
+        if (node->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES) {
+            create_device_saw_vulkan13_private =
+                reinterpret_cast<const VkPhysicalDeviceVulkan13Features*>(node)->privateData == VK_TRUE;
         }
         if (node->sType == VK_STRUCTURE_TYPE_DEVICE_PRIVATE_DATA_CREATE_INFO) {
             create_device_saw_slot_request =
@@ -384,6 +393,20 @@ int main() {
     assert(unchanged_feature && unchanged_feature->privateData == VK_FALSE);
     generated_device->reset();
     assert(generated_device_destroys == 1);
+
+    // Chaining the promoted 1.3 feature struct must enable privateData on it
+    // directly instead of injecting a conflicting VkPhysicalDevicePrivateDataFeatures
+    // node (VUID-VkDeviceCreateInfo-pNext-06532).
+    vk::PhysicalDeviceVulkan13Features v13_features{};
+    v13_features.setPrivateData(VK_FALSE);
+    vk::DeviceCreateInfo v13_device_info{};
+    v13_device_info.setNextInChain(v13_features);
+    auto v13_device = physical->createDevice(v13_device_info, {});
+    assert(v13_device && create_device_calls == 2);
+    assert(create_device_saw_vulkan13_private);
+    assert(!create_device_saw_private_data_features);
+    v13_device->reset();
+    assert(generated_device_destroys == 2);
     const int initial_slot_creates = slot_creates;
     const int initial_slot_destroys = slot_destroys;
 
