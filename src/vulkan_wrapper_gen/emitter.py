@@ -2840,6 +2840,39 @@ def _command_parts(
         )
 
     if command.c_name == "vkCreateDevice":
+        # Queues are device-owned (retrieved via vkGetDeviceQueue, not created),
+        # so they never got a control block through makeOwned. Create one per
+        # queue here, held by the device (raw pointer, released on device
+        # finalize) and registered in the device's private-data slot so borrow()
+        # finds it. The block's parent is a borrowed Device: it must not retain
+        # the device control block, or the device could never reach finalize.
+        postlude.extend(
+            [
+                "if (device && *device) {",
+                "    auto queue_dispatch = device->dispatchState().device;",
+                "    auto queue_association = device->deviceAssociation();",
+                "    if (queue_dispatch && queue_association) {",
+                "        for (const auto& queue_info : createInfo.queueCreateInfos) {",
+                "            for (uint32_t queue_index = 0; queue_index < queue_info.queueCount; ++queue_index) {",
+                "                VkQueue native_queue{};",
+                "                queue_dispatch->vkGetDeviceQueue(device_native, queue_info.queueFamilyIndex, queue_index, &native_queue);",
+                "                if (native_queue == VkQueue{}) continue;",
+                "                auto* queue_state = new (std::nothrow) detail::QueueControlBlock;",
+                "                if (!queue_state) continue;",
+                "                queue_state->native = native_queue;",
+                "                queue_state->parent = Device(device_native, *this);",
+                "                queue_state->device_dispatch = queue_dispatch;",
+                "                queue_state->native_device = device_native;",
+                "                auto register_status = queue_association.dispatch->vkSetPrivateData(queue_association.device, VK_OBJECT_TYPE_QUEUE, detail::raw_key(native_queue), queue_association.slot, static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(static_cast<detail::LifetimeHeader*>(queue_state))));",
+                "                if (register_status != VK_SUCCESS) { delete queue_state; continue; }",
+                "            }",
+                "        }",
+                "    }",
+                "}",
+            ]
+        )
+
+    if command.c_name == "vkCreateDevice":
         result_values = ir.enums.get("Result")
         overflow_error = (
             "ResultCode::ErrorTooManyObjects"
@@ -3572,6 +3605,13 @@ def _emit_handle(
                 "    VolkDeviceTable device_dispatch{};",
             ]
         )
+    elif handle.c_name == "VkQueue":
+        state_lines.extend(
+            [
+                "    const VolkDeviceTable* device_dispatch{};",
+                "    VkDevice native_device{};",
+            ]
+        )
     if handle.create_info:
         state_lines.append(
             f"    std::shared_ptr<const {_cpp_type(handle.create_info, ir, config)}> create_info;"
@@ -3659,6 +3699,13 @@ def _emit_handle(
     elif handle.c_name == "VkInstance":
         association_expr = "detail::DeviceAssociation{}"
         dispatch_expr = "detail::DispatchState{ctrl_ ? &ctrl_->instance_dispatch : &dispatch_, nullptr, {}}"
+    elif handle.c_name == "VkQueue":
+        association_expr = "parent().deviceAssociation()"
+        dispatch_expr = (
+            "ctrl_ && ctrl_->device_dispatch"
+            " ? detail::DispatchState{parent().dispatchState().instance, ctrl_->device_dispatch, ctrl_->native_device}"
+            " : parent().dispatchState()"
+        )
     else:
         association_expr = (
             "parent().deviceAssociation()"
@@ -3668,9 +3715,6 @@ def _emit_handle(
         dispatch_expr = "parent().dispatchState()" if parent else "dispatch_"
     lines.append(
         f"    [[nodiscard]] detail::DeviceAssociation deviceAssociation() const noexcept {{ return {association_expr}; }}"
-    )
-    lines.append(
-        f"    [[nodiscard]] detail::DispatchState dispatchState() const noexcept {{ return {dispatch_expr}; }}"
     )
     if parent:
         lines.append(
@@ -3694,6 +3738,9 @@ def _emit_handle(
             f"    [[nodiscard]] bool sameNativeHandle(const {name}& rhs) const noexcept {{ return raw() == rhs.raw(); }}",
             f"    friend bool operator==(const {name}& lhs, const {name}& rhs) noexcept {{ return lhs.ctrl_ == rhs.ctrl_ && lhs.raw() == rhs.raw(); }}",
         ]
+    )
+    lines.append(
+        f"    [[nodiscard]] detail::DispatchState dispatchState() const noexcept {{ return {dispatch_expr}; }}"
     )
     if handle.create_info:
         cpp_info = _cpp_type(handle.create_info, ir, config)
@@ -3876,6 +3923,21 @@ def _emit_handle_lifetime_impl(
     if handle.c_name == "VkDevice":
         lines.extend(
             [
+                "        if (self->create_info && self->device_association) {",
+                "            for (const auto& queue_info : self->create_info->queueCreateInfos) {",
+                "                for (uint32_t queue_index = 0; queue_index < queue_info.queueCount; ++queue_index) {",
+                "                    VkQueue native_queue{};",
+                "                    self->device_dispatch.vkGetDeviceQueue(self->native, queue_info.queueFamilyIndex, queue_index, &native_queue);",
+                "                    if (native_queue == VkQueue{}) continue;",
+                "                    std::uint64_t existing{};",
+                "                    self->device_dispatch.vkGetPrivateData(self->native, VK_OBJECT_TYPE_QUEUE, detail::raw_key(native_queue), self->device_association.slot, &existing);",
+                "                    if (existing) {",
+                "                        auto* state = static_cast<detail::QueueControlBlock*>(reinterpret_cast<detail::LifetimeHeader*>(static_cast<std::uintptr_t>(existing)));",
+                "                        state->release(detail::QueueControlBlock::tracking_mutex, state, &detail::QueueControlBlock::detach, &detail::QueueControlBlock::finalize);",
+                "                    }",
+                "                }",
+                "            }",
+                "        }",
                 "        if (self->device_association) {",
                 "            self->device_dispatch.vkDestroyPrivateDataSlot(self->device_association.device, self->device_association.slot, nullptr);",
                 "            self->device_association = {};",

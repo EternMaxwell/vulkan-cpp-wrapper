@@ -193,6 +193,9 @@ VKAPI_ATTR VkResult VKAPI_CALL fake_create_device(
 VKAPI_ATTR void VKAPI_CALL fake_destroy_generated_device(VkDevice, const VkAllocationCallbacks*) {
     ++generated_device_destroys;
 }
+VKAPI_ATTR void VKAPI_CALL fake_get_device_queue(VkDevice, uint32_t family, uint32_t index, VkQueue* queue) {
+    *queue = fake_handle<VkQueue>(0x3800 + family * 16 + index);
+}
 VKAPI_ATTR VkResult VKAPI_CALL fake_enumerate_physical_devices(
     VkInstance, std::uint32_t* count, VkPhysicalDevice* values) {
     ++enumerate_calls;
@@ -255,6 +258,7 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL fake_get_device_proc(VkDevice, const ch
     if (std::strcmp(name, "vkSetPrivateData") == 0) return reinterpret_cast<PFN_vkVoidFunction>(fake_set_private);
     if (std::strcmp(name, "vkGetPrivateData") == 0) return reinterpret_cast<PFN_vkVoidFunction>(fake_get_private);
     if (std::strcmp(name, "vkDestroyDevice") == 0) return reinterpret_cast<PFN_vkVoidFunction>(fake_destroy_generated_device);
+    if (std::strcmp(name, "vkGetDeviceQueue") == 0) return reinterpret_cast<PFN_vkVoidFunction>(fake_get_device_queue);
     if (std::strcmp(name, "vkQueueSubmit") == 0) return reinterpret_cast<PFN_vkVoidFunction>(fake_queue_submit);
     if (std::strcmp(name, "vkCreateGraphicsPipelines") == 0) return reinterpret_cast<PFN_vkVoidFunction>(fake_create_graphics_pipelines);
     if (std::strcmp(name, "vkDestroyPipeline") == 0) return reinterpret_cast<PFN_vkVoidFunction>(fake_destroy_pipeline);
@@ -371,6 +375,9 @@ int main() {
     generated_device_info.setNextInChain(requested_private_data);
     generated_device_info.nextInChain.get<vk::PhysicalDevicePrivateDataFeatures>()
         ->setNextInChain(requested_private_slots);
+    vk::DeviceQueueCreateInfo generated_queue_info{};
+    generated_queue_info.setQueueFamilyIndex(0).setQueuePriorities({1.0f});
+    generated_device_info.setQueueCreateInfos({generated_queue_info});
     vk::DeviceCreateInfo copied_device_info = generated_device_info;
     vk::DeviceCreateInfo::CStruct copied_native{};
     copied_device_info.to_cstruct(&copied_native);
@@ -391,6 +398,15 @@ int main() {
     generated_device_info.to_cstruct(&unchanged_native);
     auto* unchanged_feature = reinterpret_cast<const VkPhysicalDevicePrivateDataFeatures*>(unchanged_native.value.pNext);
     assert(unchanged_feature && unchanged_feature->privateData == VK_FALSE);
+    // Queues are device-owned: the device creation pre-registers a control
+    // block per queue, so getQueue returns a tracked handle with a stable id
+    // (not a bare borrowed handle with use_count() == 0).
+    auto generated_queue = generated_device->getQueue(0, 0);
+    assert(generated_queue && generated_queue.use_count() > 0);
+    auto generated_queue_again = generated_device->getQueue(0, 0);
+    assert(generated_queue_again && generated_queue_again.id() == generated_queue.id());
+    generated_queue.reset();
+    generated_queue_again.reset();
     generated_device->reset();
     assert(generated_device_destroys == 1);
 

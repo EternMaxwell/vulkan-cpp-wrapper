@@ -199,9 +199,7 @@ int main() {
     auto surface = vk::SurfaceKHR::adopt(
         rawSurface, *instance,
         [inst = *instance](VkSurfaceKHR s) noexcept {
-            VolkInstanceTable table{};
-            volkLoadInstanceTable(&table, inst.raw());
-            table.vkDestroySurfaceKHR(inst.raw(), s, nullptr);
+            inst.dispatchState().instance->vkDestroySurfaceKHR(inst.raw(), s, nullptr);
         });
     if (!surface) { std::println(stderr, "SurfaceKHR::adopt failed"); return 1; }
 

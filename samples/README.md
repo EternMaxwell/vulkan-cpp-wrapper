@@ -67,10 +67,10 @@ cmake --build samples/build
   an extension command whose extension was not enabled returns
   `ErrorExtensionNotPresent` instead of crashing.
 - `02-triangle` creates the window surface via `glfwCreateWindowSurface` and
-  adopts it into a `SurfaceKHR`; because the wrapper keeps its dispatch tables
-  private, the sample loads a local `VolkInstanceTable` in the surface's
-  destroyer. A future generator improvement is to auto-derive the deleter for
-  `adopt` from the handle's known releaser command.
+  adopts it into a `SurfaceKHR`; the surface's destroyer uses the now-public
+  `dispatchState().instance` table to call `vkDestroySurfaceKHR`. A future
+  generator improvement is to auto-derive the deleter for `adopt` from the
+  handle's known releaser command.
 - These samples surfaced and drove fixes for several generator bugs, including
   the `descriptorCount` field of `VkDescriptorSetLayoutBinding` being wrongly
   derived from `pImmutableSamplers.size()` (it is now an explicit field).
