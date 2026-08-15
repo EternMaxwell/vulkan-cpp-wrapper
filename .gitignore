@@ -68,6 +68,7 @@ generated/
 scratch/
 tmp/
 temp/
+samples/build/
 
 # Logs
 *.log
