@@ -18,14 +18,22 @@ def snake_to_pascal(name: str) -> str:
 
 def enum_name(group: str, value: str, tags: tuple[str, ...]) -> str:
     raw_group = strip_vk(group)
-    prefixes = [group.upper(), f"VK_{re.sub(r'(?<!^)(?=[A-Z])', '_', raw_group).upper()}"]
-    flag_bits = re.fullmatch(r"(.+?)FlagBits(\d*)", raw_group)
+    # Extension-suffixed groups (VkPresentModeKHR, VkSurfaceTransformFlagBitsKHR)
+    # share the prefix/stem of their base group.  Detect and strip the tag so
+    # the group prefix and the FlagBits "Bit" suffix are removed correctly.
+    base_group = raw_group
+    for tag in sorted(tags, key=len, reverse=True):
+        if raw_group.endswith(tag):
+            base_group = raw_group[: -len(tag)]
+            break
+    prefixes = [group.upper(), f"VK_{re.sub(r'(?<!^)(?=[A-Z])', '_', base_group).upper()}"]
+    flag_bits = re.fullmatch(r"(.+?)FlagBits(\d*)", base_group)
     if flag_bits:
         stem, width_suffix = flag_bits.groups()
         stem = re.sub(r"(?<!^)(?=[A-Z])", "_", stem).upper()
         prefixes.append(f"VK_{stem}{'_' + width_suffix if width_suffix else ''}")
     candidate = value
-    for prefix in sorted(prefixes, key=len, reverse=True):
+    for prefix in sorted(set(prefixes), key=len, reverse=True):
         if candidate.startswith(prefix + "_"):
             candidate = candidate[len(prefix) + 1:]
             break

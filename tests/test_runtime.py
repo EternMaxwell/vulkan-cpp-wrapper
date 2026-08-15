@@ -417,6 +417,13 @@ int main() {
     assert(device && device->use_count() == 1);
     assert(slot_creates == initial_slot_creates + 2);
 
+    // A command whose loader slot was never populated (the extension is not
+    // "enabled" in the fake loader) must report ErrorExtensionNotPresent
+    // instead of calling through a null dispatch slot.
+    auto missing_device_command = device->createBuffer(vk::BufferCreateInfo{}, std::nullopt);
+    assert(!missing_device_command);
+    assert(missing_device_command.error() == vk::ResultCode::ErrorExtensionNotPresent);
+
     int queue_finalizes = 0;
     auto queue = vk::Queue::adopt(fake_handle<VkQueue>(0x3800), *device,
         [&](VkQueue) noexcept { ++queue_finalizes; });

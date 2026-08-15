@@ -127,6 +127,20 @@ def _as_handle(ir: IrRegistry, name: str) -> Handle | None:
     return resolved if isinstance(resolved, Handle) else None
 
 
+def _is_opaque_raw(name: str, ir: IrRegistry) -> bool:
+    """True for unmodeled foreign/platform tokens.
+
+    ``SECURITY_ATTRIBUTES``, ``Display``, ``HWND`` and friends carry no XML
+    category (the raw record's ``category`` is ``None``) and are only
+    forward-declared by volk, so they cannot be wrapped by value; they must
+    pass through as raw pointers.  Enum/bitmask typedefs (``VkResult``,
+    ``VkFormat``, ...) also live in ``raw_types`` but have a real category and
+    a modeled wrapper, so they are excluded here.
+    """
+    raw = ir.raw_types.get(name)
+    return raw is not None and raw.category is None
+
+
 def _lengths(param: Param) -> tuple[str, ...]:
     return tuple(length.text for length in param.lengths)
 
@@ -378,9 +392,16 @@ def _emit_aliases(ir: IrRegistry, config: GeneratorConfig) -> str:
             if not bitmask.active or bitmask.c_name in {"VkFlags", "VkFlags64"}:
                 continue
             if _is_typed_bitmask(bitmask.name, ir):
+                bits_cpp = _cpp_type(bitmask.bits, ir, config)
                 result.append(
                     _guard(
-                        f"using {bitmask.name} = Flags<{_cpp_type(bitmask.bits, ir, config)}, {bitmask.c_name}>;",
+                        f"template <> struct FlagTraits<{bits_cpp}> {{ using MaskType = {bitmask.c_name}; }};",
+                        bitmask.protect or bitmask.availability.protect,
+                    )
+                )
+                result.append(
+                    _guard(
+                        f"using {bitmask.name} = Flags<{bits_cpp}, {bitmask.c_name}>;",
                         bitmask.protect or bitmask.availability.protect,
                     )
                 )
@@ -482,6 +503,11 @@ def _member_cpp(param: Param, ir: IrRegistry, config: GeneratorConfig) -> str:
             "bitmask",
         }:
             return f"std::optional<{value}>"
+        if param.pointer_depth == 1 and _is_opaque_raw(param.type, ir):
+            # Opaque foreign/platform tokens (SECURITY_ATTRIBUTES, Display, ...)
+            # are only forward-declared by volk, so they cannot be held by value
+            # in a std::optional. Pass the pointer through unchanged.
+            return ("const " if param.const else "") + value + "*"
         if param.pointer_depth == 1 and param.is_optional and value != "void":
             return f"std::optional<{value}>"
         if ir.resolve(param.type) is not None:
@@ -819,6 +845,7 @@ def _cstruct_cache_lines(
             member.pointer_depth == 1
             and (member.is_optional or category in {"enum", "bitmask"})
             and member.type != "void"
+            and not _is_opaque_raw(member.type, ir)
         ):
             lines.append(
                 f"        std::optional<{_native_type_name(member.type, ir)}> {member.name}_native;"
@@ -1113,6 +1140,8 @@ def _emit_struct_impl(
                         f"    {target} = &output->{member.name}_cache.value;",
                     ]
                 )
+        elif member.pointer_depth == 1 and _is_opaque_raw(member.type, ir):
+            lines.append(f"    {target} = {field};")
         elif (
             member.pointer_depth == 1
             and (member.is_optional or category in {"enum", "bitmask"})
@@ -1253,6 +1282,9 @@ def _emit_struct_impl(
                 lines.append(
                     f"    if ({source}) {field}.from_cstruct(*{source}{nested_args});"
                 )
+            continue
+        if member.pointer_depth == 1 and _is_opaque_raw(member.type, ir):
+            lines.append(f"    {field} = {source};")
             continue
         if (
             member.pointer_depth == 1
@@ -1596,13 +1628,14 @@ def _is_device_scope(handle: Handle, ir: IrRegistry) -> bool:
     return False
 
 
-def _dispatch_call(
-    command: Command, receiver: str | None, ir: IrRegistry, arguments: list[str]
+def _dispatch_function(
+    command: Command, receiver: str | None, ir: IrRegistry
 ) -> str:
+    """Resolved PFN expression for a command's dispatch table (no call)."""
     if receiver is None:
-        return f"::{command.c_name}({', '.join(arguments)})"
+        return f"::{command.c_name}"
     if command.c_name == "vkGetInstanceProcAddr":
-        return f"::vkGetInstanceProcAddr({', '.join(arguments)})"
+        return "::vkGetInstanceProcAddr"
     dispatch_type = command.params[0].type if command.params else None
     dispatch_handle = _as_handle(ir, dispatch_type) if dispatch_type else None
     instance_loaded_device_commands = {
@@ -1624,10 +1657,42 @@ def _dispatch_call(
         else "device"
     )
     if table == "device":
-        function = f'(this->dispatchState().device ? this->dispatchState().device->{command.c_name} : reinterpret_cast<PFN_{command.c_name}>(this->dispatchState().instance->vkGetDeviceProcAddr(this->dispatchState().native_device, "{command.c_name}")))'
-    else:
-        function = f"(this->dispatchState().instance ? this->dispatchState().instance->{command.c_name} : ::{command.c_name})"
-    return f"{function}({', '.join(arguments)})"
+        return (
+            f"(this->dispatchState().device ? this->dispatchState().device->{command.c_name} "
+            f": reinterpret_cast<PFN_{command.c_name}>(this->dispatchState().instance->vkGetDeviceProcAddr(this->dispatchState().native_device, \"{command.c_name}\")))"
+        )
+    # The instance table is always populated by borrow/makeOwned, so there is
+    # no global fallback (volk only exports loader-level globals; using
+    # ::vkFoo here would not link for table-level instance commands).
+    return f"this->dispatchState().instance->{command.c_name}"
+
+
+def _null_failure(result: str, command: Command) -> str:
+    """Return statement emitted when a dispatch slot is null."""
+    if result == "void":
+        return (
+            f"{{ detail::report_error(ResultCode::ErrorExtensionNotPresent, \"{command.cpp_name}\"); return; }}"
+        )
+    if result.startswith("Result<"):
+        return "{ return std::unexpected(ResultCode::ErrorExtensionNotPresent); }"
+    if result.startswith("ResultValue<"):
+        return f"{{ return {result}{{ResultCode::ErrorExtensionNotPresent, {{}}}}; }}"
+    return (
+        f"{{ detail::report_error(ResultCode::ErrorExtensionNotPresent, \"{command.cpp_name}\"); return {{}}; }}"
+    )
+
+
+def _dispatch_guard(
+    command: Command, receiver: str | None, ir: IrRegistry, result: str
+) -> list[str]:
+    """Resolve + null-check the dispatch slot before the first call."""
+    if receiver is None or command.c_name == "vkGetInstanceProcAddr":
+        return []
+    function = _dispatch_function(command, receiver, ir)
+    return [
+        f"auto dispatch_fn = {function};",
+        f"if (!dispatch_fn) {_null_failure(result, command)}",
+    ]
 
 
 def _output_handle_parent_expression(
@@ -1909,7 +1974,7 @@ def _handle_release_lambda(
                 else "release_" + _public_param_name(dispatch_handle)
             )
         if dispatch_handle is not target and dispatch_prefix:
-            call = f"({dispatch_prefix}.dispatchState().{table} ? {dispatch_prefix}.dispatchState().{table}->{release.c_name} : ::{release.c_name})({', '.join(arguments)})"
+            call = f"({dispatch_prefix}.dispatchState().{table}->{release.c_name})({', '.join(arguments)})"
         elif dispatch_handle is not target:
             call = f"::{release.c_name}({', '.join(arguments)})"
     else:
@@ -2673,8 +2738,11 @@ def _command_parts(
             ]
         )
 
-    call = _dispatch_call(command, receiver, ir, arguments)
+    guard = _dispatch_guard(command, receiver, ir, result)
+    call_target = "dispatch_fn" if guard else _dispatch_function(command, receiver, ir)
+    call = f"{call_target}({', '.join(arguments)})"
     body = list(prelude)
+    body.extend(guard)
     if command.c_return_type == "void":
         body.append(f"{call};")
         body.extend(postlude)
@@ -2915,10 +2983,13 @@ def _convenience_parts(
                     )
             else:
                 arguments.append(_public_argument(param, ir))
-    call = _dispatch_call(command, receiver, ir, arguments)
+    guard = _dispatch_guard(command, receiver, ir, result_type)
+    call_target = "dispatch_fn" if guard else _dispatch_function(command, receiver, ir)
+    prelude.extend(guard)
+    call = f"{call_target}({', '.join(arguments)})"
     null_arguments = list(arguments)
     null_arguments[command.params.index(vector)] = "nullptr"
-    null_call = _dispatch_call(command, receiver, ir, null_arguments)
+    null_call = f"{call_target}({', '.join(null_arguments)})"
     struct_storage = []
     struct_prepare = []
     if vector_category == "struct":
@@ -2979,7 +3050,7 @@ def _convenience_parts(
             retry_args[command.params.index(count)] = "&required"
             body.extend(
                 [
-                    f"            status = static_cast<ResultCode>({_dispatch_call(command, receiver, ir, retry_args)});",
+                    f"            status = static_cast<ResultCode>({call_target}({', '.join(retry_args)}));",
                     "            if (static_cast<std::int32_t>(status) < 0) break;",
                     "            native_values.resize(required);",
                     "        } while (true);",
@@ -4279,8 +4350,24 @@ class Flags {
     constexpr Flags& operator^=(Bit rhs) noexcept { return *this ^= Flags(rhs); }
     [[nodiscard]] constexpr bool operator==(const Flags&) const noexcept = default;
     [[nodiscard]] constexpr bool test(Bit bit) const noexcept { return (mask_ & static_cast<Mask>(bit)) != Mask{}; }
-    friend constexpr Flags operator|(Bit lhs, Bit rhs) noexcept { return Flags(lhs) | rhs; }
 };
+
+// Map a bit enum to its mask type; specialized alongside each typed bitmask.
+template <typename Bit> struct FlagTraits {};
+template <typename Bit> using FlagsOf = Flags<Bit, typename FlagTraits<Bit>::MaskType>;
+
+template <typename Bit>
+[[nodiscard]] constexpr FlagsOf<Bit> operator|(Bit lhs, Bit rhs) noexcept { return FlagsOf<Bit>(lhs) | rhs; }
+template <typename Bit>
+[[nodiscard]] constexpr FlagsOf<Bit> operator|(Bit lhs, FlagsOf<Bit> rhs) noexcept { return FlagsOf<Bit>(lhs) | rhs; }
+template <typename Bit>
+[[nodiscard]] constexpr FlagsOf<Bit> operator&(Bit lhs, Bit rhs) noexcept { return FlagsOf<Bit>(lhs) & rhs; }
+template <typename Bit>
+[[nodiscard]] constexpr FlagsOf<Bit> operator&(Bit lhs, FlagsOf<Bit> rhs) noexcept { return FlagsOf<Bit>(lhs) & rhs; }
+template <typename Bit>
+[[nodiscard]] constexpr FlagsOf<Bit> operator^(Bit lhs, Bit rhs) noexcept { return FlagsOf<Bit>(lhs) ^ rhs; }
+template <typename Bit>
+[[nodiscard]] constexpr FlagsOf<Bit> operator^(Bit lhs, FlagsOf<Bit> rhs) noexcept { return FlagsOf<Bit>(lhs) ^ rhs; }
 
 template <typename T> using Result = std::expected<T, ResultCode>;
 template <typename T> struct ResultValue { ResultCode status{}; T value{}; };
@@ -4544,7 +4631,7 @@ def emit_sections(
         "generated_notice": "// Generated by vulkan-wrapper-gen. Do not edit.\n",
         "namespace": config.namespace,
         "module_name": config.module,
-        "includes": "#include <volk.h>\n"
+        "includes": "#ifndef NOMINMAX\n#define NOMINMAX\n#endif\n#include <volk.h>\n"
         + (f"#include <{config.vma_include}>\n" if vma else "")
         + "#include <algorithm>\n#include <array>\n#include <atomic>\n#include <cstdint>\n#include <cstring>\n#include <expected>\n#include <functional>\n#include <limits>\n#include <memory>\n#include <mutex>\n#include <new>\n#include <optional>\n#include <ranges>\n#include <shared_mutex>\n#include <span>\n#include <string>\n#include <string_view>\n#include <typeindex>\n#include <type_traits>\n#include <unordered_map>\n#include <utility>\n#include <variant>\n#include <vector>",
         "forward_declarations": _emit_forwards(ir, config)

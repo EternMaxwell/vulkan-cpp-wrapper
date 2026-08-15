@@ -252,21 +252,42 @@ def _typedef_base(element: ET.Element) -> str | None:
 
 
 def _func_pointer(element: ET.Element, doc: str | None, protect: str | None) -> FuncPointer:
-    """Parse a ``category="funcpointer"`` typedef from its proto/param elements."""
+    """Parse a ``category="funcpointer"`` typedef from its proto/param elements.
+
+    Older registries spell a funcpointer as ``<proto><type>RET</type>
+    <name>NAME</name></proto><param>...</param>``; newer ones use an inline
+    ``typedef RET (VKAPI_PTR *<name>NAME</name>)(params)`` with the parameter
+    names inline.  Both are normalized to a ``FuncPointer``; the inline form
+    has no structured parameters, which the emitter does not need.
+    """
     proto = element.find("proto")
-    if proto is None:
-        raise RegistryError(f"funcpointer is missing its proto: {_text(element)!r}")
-    name = proto.findtext("name")
-    return_type = proto.findtext("type")
-    if not name or not return_type:
-        raise RegistryError(f"funcpointer prototype is incomplete: {_text(element)!r}")
-    params = tuple(_param(param, frozenset()) for param in element.findall("param"))
+    if proto is not None:
+        name = proto.findtext("name")
+        return_type = proto.findtext("type")
+        if not name or not return_type:
+            raise RegistryError(f"funcpointer prototype is incomplete: {_text(element)!r}")
+        params = tuple(_param(param, frozenset()) for param in element.findall("param"))
+        return FuncPointer(
+            _generalize(name),
+            name,
+            strip_vk(return_type),
+            return_type,
+            params,
+            doc,
+            protect,
+        )
+    name = element.findtext("name")
+    if not name:
+        raise RegistryError(f"funcpointer is missing its name: {_text(element)!r}")
+    declaration = _text(element)
+    match = re.search(r"typedef\s+([A-Za-z_]\w*)\s*\(\s*VKAPI_PTR\s*\*", declaration)
+    return_type = match.group(1) if match else "void"
     return FuncPointer(
         _generalize(name),
         name,
         strip_vk(return_type),
         return_type,
-        params,
+        (),
         doc,
         protect,
     )
