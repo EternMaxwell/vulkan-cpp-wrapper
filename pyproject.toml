@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "vulkan-wrapper-generator"
+version = "0.1.0"
+description = "Generate configurable C++23 RAII wrappers from the Vulkan XML registry"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "vulkan-wrapper contributors" }]
+dependencies = []
+
+[project.optional-dependencies]
+vma = ["libclang>=18"]
+test = ["pytest>=8", "libclang>=18"]
+
+[project.scripts]
+vulkan-wrapper-gen = "vulkan_wrapper_gen.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/vulkan_wrapper_gen"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"templates" = "vulkan_wrapper_gen/templates"
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]

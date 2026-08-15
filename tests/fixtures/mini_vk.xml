@@ -1,0 +1,156 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<registry>
+  <platforms><platform name="win32" protect="VK_USE_PLATFORM_WIN32_KHR"/></platforms>
+  <tags><tag name="KHR"/><tag name="EXT"/></tags>
+  <types>
+    <type category="basetype"><type>uint32_t</type> <name>VkFlags</name></type>
+    <type category="enum" name="VkResult"/>
+    <type category="enum" name="VkStructureType"/>
+    <type category="enum" name="VkBufferUsageFlagBits"/>
+    <type category="bitmask" requires="VkBufferUsageFlagBits"><type>VkFlags</type> <name>VkBufferUsageFlags</name></type>
+    <type category="handle" objtypeenum="VK_OBJECT_TYPE_INSTANCE"><type>VK_DEFINE_HANDLE</type>(<name>VkInstance</name>)</type>
+    <type category="handle" parent="VkInstance" objtypeenum="VK_OBJECT_TYPE_PHYSICAL_DEVICE"><type>VK_DEFINE_HANDLE</type>(<name>VkPhysicalDevice</name>)</type>
+    <type category="handle" parent="VkPhysicalDevice" objtypeenum="VK_OBJECT_TYPE_DEVICE"><type>VK_DEFINE_HANDLE</type>(<name>VkDevice</name>)</type>
+    <type category="handle" parent="VkDevice" objtypeenum="VK_OBJECT_TYPE_QUEUE"><type>VK_DEFINE_HANDLE</type>(<name>VkQueue</name>)</type>
+    <type category="handle" parent="VkDevice" objtypeenum="VK_OBJECT_TYPE_BUFFER"><type>VK_DEFINE_NON_DISPATCHABLE_HANDLE</type>(<name>VkBuffer</name>)</type>
+    <type name="VkBufferEXT" alias="VkBuffer"/>
+    <type category="handle" parent="VkDevice" objtypeenum="VK_OBJECT_TYPE_FENCE"><type>VK_DEFINE_NON_DISPATCHABLE_HANDLE</type>(<name>VkFence</name>)</type>
+    <type category="handle" parent="VkDevice" objtypeenum="VK_OBJECT_TYPE_PIPELINE_CACHE"><type>VK_DEFINE_NON_DISPATCHABLE_HANDLE</type>(<name>VkPipelineCache</name>)</type>
+    <type category="handle" parent="VkDevice" objtypeenum="VK_OBJECT_TYPE_PIPELINE"><type>VK_DEFINE_NON_DISPATCHABLE_HANDLE</type>(<name>VkPipeline</name>)</type>
+    <type category="struct" name="VkBufferCreateInfo">
+      <member values="VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO"><type>VkStructureType</type> <name>sType</name></member>
+      <member optional="true">const <type>void</type>* <name>pNext</name></member>
+      <member><type>uint32_t</type> <name>size</name></member>
+      <member><type>VkBufferUsageFlags</type> <name>usage</name></member>
+    </type>
+    <type name="VkBufferCreateInfoEXT" alias="VkBufferCreateInfo"/>
+    <type category="struct" name="VkExtraInfo" structextends="VkBufferCreateInfo">
+      <member values="VK_STRUCTURE_TYPE_EXTRA_INFO"><type>VkStructureType</type> <name>sType</name></member>
+      <member optional="true">const <type>void</type>* <name>pNext</name></member>
+    </type>
+    <type category="struct" name="VkVideoProfileInfoKHR">
+      <member values="VK_STRUCTURE_TYPE_VIDEO_PROFILE_INFO_KHR"><type>VkStructureType</type> <name>sType</name></member>
+      <member optional="true">const <type>void</type>* <name>pNext</name></member>
+      <member><type>uint32_t</type> <name>codecOperation</name></member>
+    </type>
+    <type category="struct" name="VkVideoProfileListInfoKHR">
+      <member values="VK_STRUCTURE_TYPE_VIDEO_PROFILE_LIST_INFO_KHR"><type>VkStructureType</type> <name>sType</name></member>
+      <member optional="true">const <type>void</type>* <name>pNext</name></member>
+      <member optional="true"><type>uint32_t</type> <name>profileCount</name></member>
+      <member len="profileCount">const <type>VkVideoProfileInfoKHR</type>* <name>pProfiles</name></member>
+    </type>
+    <type category="struct" name="VkGraphicsPipelineCreateInfo">
+      <member values="VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO"><type>VkStructureType</type> <name>sType</name></member>
+      <member optional="true">const <type>void</type>* <name>pNext</name></member>
+    </type>
+    <type category="struct" name="VkSubmitInfo">
+      <member values="VK_STRUCTURE_TYPE_SUBMIT_INFO"><type>VkStructureType</type> <name>sType</name></member>
+      <member optional="true">const <type>void</type>* <name>pNext</name></member>
+    </type>
+    <type category="struct" name="VkShaderModuleCreateInfo">
+      <member values="VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO"><type>VkStructureType</type> <name>sType</name></member>
+      <member optional="true">const <type>void</type>* <name>pNext</name></member>
+      <member><type>size_t</type> <name>codeSize</name></member>
+      <member len="latexmath:[\textrm{codeSize} \over 4]" altlen="codeSize / 4"><comment>SPIR-V bytecode</comment>const <type>uint32_t</type>* <name>pCode</name></member>
+    </type>
+    <type category="struct" name="VkAccelerationStructureGeometryKHR">
+      <member><type>uint32_t</type> <name>geometryType</name></member>
+    </type>
+    <type category="struct" name="VkAccelerationStructureBuildGeometryInfoKHR">
+      <member><type>uint32_t</type> <name>geometryCount</name></member>
+      <member optional="true,false" len="geometryCount,1">const <type>VkAccelerationStructureGeometryKHR</type>* const* <name>ppGeometries</name></member>
+    </type>
+    <type category="struct" name="VkAccelerationStructureBuildRangeInfoKHR">
+      <member><type>uint32_t</type> <name>primitiveCount</name></member>
+    </type>
+    <type category="struct" name="VkAllocationCallbacks">
+      <member optional="true"><type>void</type>* <name>pUserData</name></member>
+    </type>
+  </types>
+  <enums name="API Constants" type="constants">
+    <enum name="VK_MAX_TEST" type="uint32_t" value="16U"/>
+  </enums>
+  <enums name="VkResult" type="enum" comment="API result codes">
+    <enum name="VK_SUCCESS" value="0"/>
+    <enum name="VK_INCOMPLETE" value="5"/>
+    <enum name="VK_ERROR_UNKNOWN" value="-13" comment="An unknown error has occurred"/>
+  </enums>
+  <enums name="VkBufferUsageFlagBits" type="bitmask">
+    <enum name="VK_BUFFER_USAGE_TRANSFER_SRC_BIT" bitpos="0"/>
+    <enum name="VK_BUFFER_USAGE_TRANSFER_DST_BIT" bitpos="1"/>
+  </enums>
+  <commands>
+    <command successcodes="VK_SUCCESS" errorcodes="VK_ERROR_UNKNOWN">
+      <proto><type>VkResult</type> <name>vkCreateBuffer</name></proto>
+      <param><type>VkDevice</type> <name>device</name></param>
+      <param>const <type>VkBufferCreateInfo</type>* <name>pCreateInfo</name></param>
+      <param optional="true">const <type>VkAllocationCallbacks</type>* <name>pAllocator</name></param>
+      <param><type>VkBuffer</type>* <name>pBuffer</name></param>
+    </command>
+    <command>
+      <proto><type>void</type> <name>vkDestroyBuffer</name></proto>
+      <param><type>VkDevice</type> <name>device</name></param>
+      <param><type>VkBuffer</type> <name>buffer</name></param>
+      <param optional="true">const <type>VkAllocationCallbacks</type>* <name>pAllocator</name></param>
+    </command>
+    <command successcodes="VK_SUCCESS" errorcodes="VK_ERROR_UNKNOWN">
+      <proto><type>VkResult</type> <name>vkQueueSubmit</name></proto>
+      <param><type>VkQueue</type> <name>queue</name></param>
+      <param><type>uint32_t</type> <name>submitCount</name></param>
+      <param len="submitCount">const <type>VkSubmitInfo</type>* <name>pSubmits</name></param>
+      <param optional="true"><type>VkFence</type> <name>fence</name></param>
+    </command>
+    <command successcodes="VK_SUCCESS" errorcodes="VK_ERROR_UNKNOWN">
+      <proto><type>VkResult</type> <name>vkDeviceWaitIdle</name></proto>
+      <param><type>VkDevice</type> <name>device</name></param>
+    </command>
+    <command>
+      <proto><type>void</type> <name>vkGetQueueSubmitInfos</name></proto>
+      <param><type>VkQueue</type> <name>queue</name></param>
+      <param><type>uint32_t</type>* <name>pSubmitCount</name></param>
+      <param optional="true" len="pSubmitCount"><type>VkSubmitInfo</type>* <name>pSubmits</name></param>
+    </command>
+    <command successcodes="VK_SUCCESS,VK_INCOMPLETE" errorcodes="VK_ERROR_UNKNOWN">
+      <proto><type>VkResult</type> <name>vkEnumerateInstanceExtensionProperties</name></proto>
+      <param optional="true" len="null-terminated">const <type>char</type>* <name>pLayerName</name></param>
+      <param><type>uint32_t</type>* <name>pPropertyCount</name></param>
+      <param optional="true" len="pPropertyCount"><type>uint32_t</type>* <name>pProperties</name></param>
+    </command>
+    <command successcodes="VK_SUCCESS,VK_INCOMPLETE" errorcodes="VK_ERROR_UNKNOWN">
+      <proto><type>VkResult</type> <name>vkEnumerateBuffersEXT</name></proto>
+      <param><type>VkDevice</type> <name>device</name></param>
+      <param><type>uint32_t</type>* <name>pBufferCount</name></param>
+      <param optional="true" len="pBufferCount"><type>VkBuffer</type>* <name>pBuffers</name></param>
+    </command>
+    <command>
+      <proto><type>void</type> <name>vkUseBufferEXT</name></proto>
+      <param><type>VkDevice</type> <name>device</name></param>
+      <param externsync="true"><type>VkBuffer</type> <name>buffer</name></param>
+      <param><type>VkFence</type> <name>fence</name></param>
+    </command>
+    <command successcodes="VK_SUCCESS,VK_INCOMPLETE" errorcodes="VK_ERROR_UNKNOWN">
+      <proto><type>VkResult</type> <name>vkCreateGraphicsPipelines</name></proto>
+      <param><type>VkDevice</type> <name>device</name></param>
+      <param optional="true" externsync="maybe"><type>VkPipelineCache</type> <name>pipelineCache</name></param>
+      <param><type>uint32_t</type> <name>createInfoCount</name></param>
+      <param len="createInfoCount">const <type>VkGraphicsPipelineCreateInfo</type>* <name>pCreateInfos</name></param>
+      <param optional="true">const <type>VkAllocationCallbacks</type>* <name>pAllocator</name></param>
+      <param len="createInfoCount"><type>VkPipeline</type>* <name>pPipelines</name></param>
+    </command>
+    <command successcodes="VK_SUCCESS" errorcodes="VK_ERROR_UNKNOWN">
+      <proto><type>VkResult</type> <name>vkBuildAccelerationStructuresKHR</name></proto>
+      <param><type>VkDevice</type> <name>device</name></param>
+      <param><type>uint32_t</type> <name>infoCount</name></param>
+      <param len="infoCount">const <type>VkAccelerationStructureBuildGeometryInfoKHR</type>* <name>pInfos</name></param>
+      <param len="infoCount">const <type>VkAccelerationStructureBuildRangeInfoKHR</type>* const* <name>ppBuildRangeInfos</name></param>
+    </command>
+  </commands>
+  <feature api="vulkan" name="VK_VERSION_1_0" number="1.0" comment="Core 1.0 functionality">
+    <require><type name="VkBuffer"/><type name="VkQueue"/><command name="vkCreateBuffer"/><command name="vkDestroyBuffer"/><command name="vkQueueSubmit"/><command name="vkDeviceWaitIdle"/><command name="vkGetQueueSubmitInfos"/><command name="vkEnumerateInstanceExtensionProperties"/></require>
+  </feature>
+  <extensions>
+    <extension name="VK_EXT_test" number="999" supported="vulkan">
+      <require><command name="vkEnumerateBuffersEXT"/><command name="vkUseBufferEXT"/><command name="vkBuildAccelerationStructuresKHR"/></require>
+    </extension>
+  </extensions>
+</registry>

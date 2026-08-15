@@ -1,0 +1,35 @@
+version = 1
+
+[generator]
+namespace = "vk"
+module = "vulkan.wrapper"
+api = "vulkan"
+minimum_core = "1.3"
+
+[filters]
+include_extensions = ["*"]
+exclude_extensions = []
+exclude_commands = []
+exclude_types = []
+
+[naming.types]
+
+[naming.commands]
+
+[vma]
+include = "vk_mem_alloc.h"
+functions = [
+  "vmaCreateAllocator",
+  "vmaDestroyAllocator",
+  "vmaAllocateMemory",
+  "vmaFreeMemory",
+  "vmaMapMemory",
+  "vmaUnmapMemory",
+  "vmaFlushAllocation",
+  "vmaInvalidateAllocation",
+  "vmaGetAllocationInfo",
+  "vmaCreateBuffer",
+  "vmaDestroyBuffer",
+  "vmaCreateImage",
+  "vmaDestroyImage",
+]

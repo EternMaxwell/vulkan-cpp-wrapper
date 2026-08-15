@@ -1,0 +1,69 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/checkout@v4
+        with:
+          repository: KhronosGroup/Vulkan-Headers
+          ref: v1.4.321
+          path: .ci/Vulkan-Headers
+      - uses: actions/checkout@v4
+        with:
+          repository: zeux/volk
+          ref: 1.4.321
+          path: .ci/volk
+      - uses: actions/checkout@v4
+        with:
+          repository: GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator
+          ref: v3.3.0
+          path: .ci/VulkanMemoryAllocator
+      - run: python -m pip install -e ".[test]"
+      - run: python -m pytest -q
+      - run: >-
+          vulkan-wrapper-gen
+          --registry .ci/Vulkan-Headers/registry/vk.xml
+          --registry .ci/Vulkan-Headers/registry/video.xml
+          --vma-header .ci/VulkanMemoryAllocator/include/vk_mem_alloc.h
+          --clang-arg=-I.ci/Vulkan-Headers/include
+          --template templates/vulkan-header-only.template.hpp
+          --output build/generated/header/vulkan_wrapper.hpp
+          --template templates/vulkan.template.hpp
+          --output build/generated/paired/vulkan_wrapper.hpp
+          --template templates/vulkan.template.cpp
+          --output build/generated/paired/vulkan_wrapper.cpp
+          --template templates/vulkan.template.cppm
+          --output build/generated/module/vulkan_wrapper.cppm
+      - run: cmake -E echo "#include <vulkan_wrapper.hpp>" > build/generated/header/compile.cpp
+      - run: >-
+          clang++ -std=c++23 -fsyntax-only
+          -Ibuild/generated/header
+          -I.ci/volk
+          -I.ci/VulkanMemoryAllocator/include
+          -I.ci/Vulkan-Headers/include
+          build/generated/header/compile.cpp
+      - run: >-
+          clang++ -std=c++23 -fsyntax-only
+          -Ibuild/generated/paired
+          -I.ci/volk
+          -I.ci/VulkanMemoryAllocator/include
+          -I.ci/Vulkan-Headers/include
+          build/generated/paired/vulkan_wrapper.cpp
+      - run: >-
+          clang++ -std=c++23 -fsyntax-only -x c++-module
+          -I.ci/volk
+          -I.ci/VulkanMemoryAllocator/include
+          -I.ci/Vulkan-Headers/include
+          build/generated/module/vulkan_wrapper.cppm
