@@ -1,9 +1,73 @@
+# Python
 __pycache__/
 *.py[cod]
+*$py.class
 *.egg-info/
-.pytest_cache/
+.eggs/
+*.egg
 .venv/
-build/
+venv/
+env/
+.python-version
 dist/
-generated/
+build/
+sdist/
+*.so
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.coverage.*
+hypothesis/
+wheels/
+pip-wheel-metadata/
+uv.lock
 
+# C / C++
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dll
+*.dylib
+*.exe
+*.out
+*.app
+*.pdb
+*.ilk
+*.exp
+*.pcm
+*.gch
+compile_commands.json
+.cache/
+CMakeCache.txt
+CMakeFiles/
+cmake-build-*/
+build/
+*.vcxproj.user
+
+# Editors / IDEs / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.code-workspace
+
+# Generated output and scratch work
+generated/
+scratch/
+tmp/
+temp/
+
+# Logs
+*.log
