@@ -550,6 +550,65 @@ def test_registry_constants_receive_safe_cpp_names(tmp_path):
     assert "layerName_native ? layerName_native->c_str() : nullptr" in generated
 
 
+def test_externsync_shared_locks_and_config_option(tmp_path):
+    output = tmp_path / "wrapper.hpp"
+    assert (
+        run(
+            [
+                "--registry",
+                str(FIXTURE),
+                "--emit", str(ROOT / "templates" / "vulkan-header-only.template.hpp") + ":" + str(output),
+            ]
+        )
+        == 0
+    )
+    generated = output.read_text(encoding="utf-8")
+    use_buffer = generated[generated.index("inline void Device::useBufferEXT") :]
+    use_buffer = use_buffer[: use_buffer.index("\n}")]
+    # The externsync'd buffer gets an exclusive lock; the receiver and the
+    # non-externsync input handle (fence) get shared locks so they serialize
+    # against the exclusive one.
+    assert "collect(buffer, true, externsync_states)" in use_buffer
+    assert "collect(*this, false, externsync_states)" in use_buffer
+    assert "collect(fence, false, externsync_states)" in use_buffer
+
+    # Disabling externsync in the config drops the lock machinery from commands.
+    config = tmp_path / "no-externsync.toml"
+    config.write_text("version = 1\n[generator]\nexternsync = false\n", encoding="utf-8")
+    plain = tmp_path / "plain.hpp"
+    assert (
+        run(
+            [
+                "--registry",
+                str(FIXTURE),
+                "--config",
+                str(config),
+                "--emit", str(ROOT / "templates" / "vulkan-header-only.template.hpp") + ":" + str(plain),
+            ]
+        )
+        == 0
+    )
+    plain_text = plain.read_text(encoding="utf-8")
+    assert "externsync_states" not in plain_text
+    assert "StateLocks externsync_locks" not in plain_text
+
+    # The CLI flag is equivalent to the config option.
+    flagged = tmp_path / "flagged.hpp"
+    assert (
+        run(
+            [
+                "--registry",
+                str(FIXTURE),
+                "--no-externsync",
+                "--emit", str(ROOT / "templates" / "vulkan-header-only.template.hpp") + ":" + str(flagged),
+            ]
+        )
+        == 0
+    )
+    flagged_text = flagged.read_text(encoding="utf-8")
+    assert "externsync_states" not in flagged_text
+
+
 FIXTURE = ROOT / "tests" / "fixtures" / "mini_vk.xml"
 
 

@@ -913,3 +913,79 @@ int main() {
     assert compiled.returncode == 0, compiled.stdout + compiled.stderr
     executed = subprocess.run([str(executable)], text=True, capture_output=True)
     assert executed.returncode == 0, executed.stdout + executed.stderr
+
+
+def test_externsync_disabled_generates_a_working_wrapper(tmp_path: Path):
+    compiler = _compiler()
+    headers = _dependency("Vulkan-Headers")
+    volk = _dependency("volk")
+    if not compiler or not headers or not volk:
+        pytest.skip("runtime C++ test needs a compiler, Vulkan-Headers, and Volk")
+
+    generated = tmp_path / "vulkan_wrapper.hpp"
+    assert (
+        run(
+            [
+                "--registry",
+                str(headers / "registry" / "vk.xml"),
+                "--no-externsync",
+                "--emit", str(ROOT / "templates" / "vulkan-header-only.template.hpp") + ":" + str(generated),
+            ]
+        )
+        == 0
+    )
+    text = generated.read_text(encoding="utf-8")
+    assert "externsync_states" not in text
+
+    source = tmp_path / "no_sync.cpp"
+    source.write_text(
+        r"""
+#define VOLK_IMPLEMENTATION
+#include <volk.h>
+#include "vulkan_wrapper.hpp"
+#include <cassert>
+
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL fake_get_instance_proc(VkInstance, const char*) {
+    return nullptr;
+}
+
+int main() {
+    volkInitializeCustom(fake_get_instance_proc);
+    int destroyed = 0;
+    auto instance = vk::Instance::adopt(
+        reinterpret_cast<VkInstance>(0x1000),
+        [&](VkInstance) noexcept { ++destroyed; });
+    assert(instance && destroyed == 0);
+    auto copy = *instance;
+    assert(instance->use_count() == 2 && destroyed == 0);
+    instance->reset();
+    assert(destroyed == 0);
+    copy.reset();
+    assert(destroyed == 1);
+    return 0;
+}
+""",
+        encoding="utf-8",
+    )
+
+    executable = tmp_path / ("no_sync.exe" if os.name == "nt" else "no_sync")
+    command = [
+        compiler,
+        "-std=c++23",
+        "-O0",
+        "-I",
+        str(tmp_path),
+        "-I",
+        str(volk),
+        "-I",
+        str(headers / "include"),
+        str(source),
+        "-o",
+        str(executable),
+    ]
+    if os.name != "nt":
+        command.append("-ldl")
+    compiled = subprocess.run(command, text=True, capture_output=True)
+    assert compiled.returncode == 0, compiled.stdout + compiled.stderr
+    executed = subprocess.run([str(executable)], text=True, capture_output=True)
+    assert executed.returncode == 0, executed.stdout + executed.stderr

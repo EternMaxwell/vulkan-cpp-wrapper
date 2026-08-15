@@ -24,6 +24,7 @@ class GeneratorConfig:
     api: str = "vulkan"
     minimum_core: str = "1.3"
     emit_docs: bool = False
+    externsync: bool = True
     include_extensions: tuple[str, ...] = ("*",)
     exclude_extensions: tuple[str, ...] = ()
     exclude_commands: tuple[str, ...] = ()
@@ -86,6 +87,7 @@ def load_config(path: Path | None = None) -> GeneratorConfig:
         api=str(project.get("api", "vulkan")),
         minimum_core=str(project.get("minimum_core", "1.3")),
         emit_docs=bool(project.get("emit_docs", False)),
+        externsync=bool(project.get("externsync", True)),
         include_extensions=_strings(filters.get("include_extensions", ["*"]), "filters.include_extensions"),
         exclude_extensions=_strings(filters.get("exclude_extensions"), "filters.exclude_extensions"),
         exclude_commands=_strings(filters.get("exclude_commands"), "filters.exclude_commands"),

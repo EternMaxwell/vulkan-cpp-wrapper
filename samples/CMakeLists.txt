@@ -61,6 +61,11 @@ endif()
 # Generate the wrapper header into the build tree.
 # ---------------------------------------------------------------------------
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
+option(VULKAN_WRAPPER_EXTERNSYNC "Generate externsync locking in the wrapper" ON)
+set(WRAPPER_SYNC_FLAG "")
+if (NOT VULKAN_WRAPPER_EXTERNSYNC)
+    set(WRAPPER_SYNC_FLAG --no-externsync)
+endif()
 set(WRAPPER ${CMAKE_BINARY_DIR}/generated/vulkan_wrapper.hpp)
 file(GLOB_RECURSE WRAPPER_GEN_SOURCES
     ${REPO_ROOT}/src/vulkan_wrapper_gen/*.py
@@ -71,6 +76,7 @@ add_custom_command(
     COMMAND ${Python3_EXECUTABLE} -m vulkan_wrapper_gen
         --registry ${vulkan_headers_SOURCE_DIR}/registry/vk.xml
         --registry ${vulkan_headers_SOURCE_DIR}/registry/video.xml
+        ${WRAPPER_SYNC_FLAG}
         --emit ${REPO_ROOT}/templates/vulkan-header-only.template.hpp:${WRAPPER}
     WORKING_DIRECTORY ${REPO_ROOT}
     DEPENDS ${WRAPPER_GEN_SOURCES}
@@ -89,6 +95,7 @@ add_custom_command(
         --registry ${vulkan_headers_SOURCE_DIR}/registry/video.xml
         --vma-header ${vma_SOURCE_DIR}/include/vk_mem_alloc.h
         --clang-arg=-I${vulkan_headers_SOURCE_DIR}/include
+        ${WRAPPER_SYNC_FLAG}
         --emit ${REPO_ROOT}/templates/vulkan-header-only.template.hpp:${WRAPPER_VMA}
     WORKING_DIRECTORY ${REPO_ROOT}
     DEPENDS ${WRAPPER_GEN_SOURCES}

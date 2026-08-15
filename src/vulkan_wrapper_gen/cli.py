@@ -40,6 +40,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--clang-arg", action="append", default=[], help="Argument forwarded to libclang")
     parser.add_argument("--config", type=Path, help="Versioned TOML generator configuration")
     parser.add_argument("--namespace", help="Override the configured C++ namespace")
+    parser.add_argument("--no-externsync", action="store_true",
+                        help="Disable externsync locking in generated commands")
     parser.add_argument("--emit", action="append", metavar="TEMPLATE:OUTPUT",
                         help="Render TEMPLATE to OUTPUT; repeat for a header/source pair")
     parser.add_argument("--emit-ir", type=Path,
@@ -55,6 +57,8 @@ def run(arguments: list[str] | None = None) -> int:
     config = load_config(args.config)
     if args.namespace:
         config.namespace = args.namespace
+    if args.no_externsync:
+        config.externsync = False
     if args.emit_ir:
         ir = build_ir(
             args.registry,

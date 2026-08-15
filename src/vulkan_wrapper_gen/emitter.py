@@ -1598,7 +1598,10 @@ def _externsync_lines(
     receiver: str | None,
     ir: IrRegistry,
     result_type: str,
+    config: GeneratorConfig,
 ) -> list[str]:
+    if not config.externsync:
+        return []
     bound = (
         _bound_handle_wrapper_arguments(command, receiver, ir) if receiver else {}
     )
@@ -1664,11 +1667,34 @@ def _externsync_lines(
         and receiver == "Device"
         and any("VkQueue" in text for text in command.implicit_externsync)
     )
+    # Shared (non-exclusive) locks for the receiver and every input handle the
+    # command reads without externsyncing it. They serialize against the
+    # exclusive externsync locks above; StateLocks dedup prefers exclusive.
+    shared_targets: list[tuple[str, bool, bool]] = []
+    if receiver is not None:
+        shared_targets.append(("*this", False, False))
+    for param in command.params:
+        if _type_category(param.type, ir) != "handle":
+            continue
+        if param.externsync:
+            continue
+        if param.direction != "input":
+            continue
+        if id(param) in bound:
+            continue
+        shared_targets.append(
+            (
+                _public_param_name(param),
+                bool(_lengths(param)),
+                param.is_optional,
+            )
+        )
     if (
         not targets
         and not dynamic_targets
         and not parent_exclusive
         and not receiver_exclusive
+        and not shared_targets
     ):
         return []
     if result_type.startswith("ResultValue<"):
@@ -1743,6 +1769,32 @@ def _externsync_lines(
                 f"if (!externsync_receiver) {{ auto& lock = externsync_receiver; {failure} }}",
             ]
         )
+    for index, (expression, is_span, is_optional) in enumerate(shared_targets):
+        if is_span:
+            lines.extend(
+                [
+                    f"for (const auto& value : {expression}) {{",
+                    "    auto lock = detail::ExternsyncAccess::collect(value, false, externsync_states);",
+                    f"    if (!lock) {{ {failure} }}",
+                    "}",
+                ]
+            )
+        elif is_optional:
+            lines.extend(
+                [
+                    f"if ({expression}) {{",
+                    f"    auto lock = detail::ExternsyncAccess::collect({expression}, false, externsync_states);",
+                    f"    if (!lock) {{ {failure} }}",
+                    "}",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    f"auto externsync_shared_{index} = detail::ExternsyncAccess::collect({expression}, false, externsync_states);",
+                    f"if (!externsync_shared_{index}) {{ auto& lock = externsync_shared_{index}; {failure} }}",
+                ]
+            )
     lines.append("detail::StateLocks externsync_locks(externsync_states);")
     return lines
 
@@ -2270,7 +2322,7 @@ def _command_parts(
     postlude: list[str] = []
     failure_cleanup: list[str] = []
     arguments: list[str] = []
-    prelude.extend(_externsync_lines(command, receiver, ir, result))
+    prelude.extend(_externsync_lines(command, receiver, ir, result, config))
     value_locals: dict[int, str] = {}
     if value_outputs:
         if len(value_outputs) > 1:

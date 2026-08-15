@@ -14,6 +14,16 @@ cmake -S samples -B samples/build
 cmake --build samples/build
 ```
 
+The wrapper is generated with externsync locking by default (exclusive locks on
+externsync'd handles, shared locks on other handle accesses). Pass
+`-DVULKAN_WRAPPER_EXTERNSYNC=OFF` to generate the zero-lock variant; the samples
+are single-threaded, so both variants run identically:
+
+```console
+cmake -S samples -B samples/build-nosync -DVULKAN_WRAPPER_EXTERNSYNC=OFF
+cmake --build samples/build-nosync
+```
+
 ## Samples
 
 - `01-info` — enumerates the instance and physical devices/queue families.
