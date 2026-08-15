@@ -528,11 +528,20 @@ def _safe_default(param: Param, cpp_type: str) -> str:
 # Struct helpers
 # ---------------------------------------------------------------------------
 
+# Members whose `len` count must stay an explicit, settable field instead of
+# being derived from the array's size. pImmutableSamplers is only conditionally
+# descriptorCount-sized (and only for sampler descriptor types), so deriving
+# descriptorCount from immutableSamplers.size() would be wrong.
+_NON_DERIVED_COUNT_MEMBERS = {"pImmutableSamplers"}
+
+
 def _count_sources(struct: Struct) -> dict[str, Param]:
     result: dict[str, Param] = {}
     member_names = {member.name for member in struct.members}
     for member in struct.members:
         if "[" in member.c_suffix:
+            continue
+        if member.name in _NON_DERIVED_COUNT_MEMBERS:
             continue
         for length in _lengths(member):
             if re.fullmatch(r"[A-Za-z_]\w*", length):
@@ -913,17 +922,14 @@ def _emit_struct(
             f"    {name}&& set{method}({cpp} value) && {{ {field_name} = std::move(value); return std::move(*this); }}"
         )
     if "pNext" in {member.name for member in struct.members}:
+        # No compile-time "extends" constraint here: Vulkan validates the pNext
+        # chain at runtime (validation layers / driver). This keeps the chain a
+        # single linked list built with `a.setNextInChain(std::move(b.setNextInChain(c)))`.
         lines.append(
-            f"    template <typename T> requires StructureExtends<{name}, std::remove_cvref_t<T>>::value"
+            f"    template <typename T> {name}& setNextInChain(T&& value) & {{ nextInChain.set(std::forward<T>(value)); return *this; }}"
         )
         lines.append(
-            f"    {name}& setNextInChain(T&& value) & {{ nextInChain.set(std::forward<T>(value)); return *this; }}"
-        )
-        lines.append(
-            f"    template <typename T> requires StructureExtends<{name}, std::remove_cvref_t<T>>::value"
-        )
-        lines.append(
-            f"    {name}&& setNextInChain(T&& value) && {{ nextInChain.set(std::forward<T>(value)); return std::move(*this); }}"
+            f"    template <typename T> {name}&& setNextInChain(T&& value) && {{ nextInChain.set(std::forward<T>(value)); return std::move(*this); }}"
         )
     lines.extend(line.rstrip("\r\n") for line in injection)
     lines.extend(
@@ -4376,7 +4382,7 @@ class ExtensionChain {
     struct Value {
         virtual ~Value() = default;
         virtual std::unique_ptr<Value> clone() const = 0;
-        virtual const void* native(const void* next) const = 0;
+        virtual const void* native() const = 0;
         virtual void refresh() = 0;
         [[nodiscard]] virtual std::type_index type() const noexcept = 0;
         [[nodiscard]] virtual void* object() noexcept = 0;
@@ -4387,11 +4393,10 @@ class ExtensionChain {
         mutable typename T::CStruct cache{};
         explicit Model(T input) : value(std::move(input)) {}
         std::unique_ptr<Value> clone() const override { return std::make_unique<Model>(value); }
-        const void* native(const void* next) const override {
+        const void* native() const override {
+            // to_cstruct links cache.value.pNext to value.nextInChain.native()
+            // recursively, so a chain is a single linked list of native nodes.
             value.to_cstruct(&cache);
-            auto* tail = reinterpret_cast<VkBaseOutStructure*>(&cache.value);
-            while (tail->pNext) tail = tail->pNext;
-            tail->pNext = reinterpret_cast<VkBaseOutStructure*>(const_cast<void*>(next));
             return &cache.value;
         }
         void refresh() override { value.from_output_cstruct(cache.value); }
@@ -4399,28 +4404,22 @@ class ExtensionChain {
         [[nodiscard]] void* object() noexcept override { return &value; }
         [[nodiscard]] const void* object() const noexcept override { return &value; }
     };
-    std::vector<std::unique_ptr<Value>> values_;
+    std::unique_ptr<Value> value_;
   public:
     ExtensionChain() = default;
-    ExtensionChain(const ExtensionChain& rhs) { values_.reserve(rhs.values_.size()); for (const auto& value : rhs.values_) values_.push_back(value->clone()); }
+    ExtensionChain(const ExtensionChain& rhs) : value_(rhs.value_ ? rhs.value_->clone() : nullptr) {}
     ExtensionChain(ExtensionChain&&) noexcept = default;
-    ExtensionChain& operator=(const ExtensionChain& rhs) { ExtensionChain copy(rhs); values_.swap(copy.values_); return *this; }
+    ExtensionChain& operator=(const ExtensionChain& rhs) { if (this != &rhs) value_ = rhs.value_ ? rhs.value_->clone() : nullptr; return *this; }
     ExtensionChain& operator=(ExtensionChain&&) noexcept = default;
-    template <typename T> void set(T&& value) { values_.push_back(std::make_unique<Model<std::remove_cvref_t<T>>>(std::forward<T>(value))); }
-    void refresh() { for (auto& value : values_) value->refresh(); }
+    template <typename T> void set(T&& value) { value_ = std::make_unique<Model<std::remove_cvref_t<T>>>(std::forward<T>(value)); }
+    void refresh() { if (value_) value_->refresh(); }
     template <typename T> [[nodiscard]] T* get() noexcept {
-        for (auto& value : values_) if (value->type() == typeid(T)) return static_cast<T*>(value->object());
-        return nullptr;
+        return value_ && value_->type() == typeid(T) ? static_cast<T*>(value_->object()) : nullptr;
     }
     template <typename T> [[nodiscard]] const T* get() const noexcept {
-        for (const auto& value : values_) if (value->type() == typeid(T)) return static_cast<const T*>(value->object());
-        return nullptr;
+        return value_ && value_->type() == typeid(T) ? static_cast<const T*>(value_->object()) : nullptr;
     }
-    [[nodiscard]] const void* native() const {
-        const void* next{};
-        for (auto it = values_.rbegin(); it != values_.rend(); ++it) next = (*it)->native(next);
-        return next;
-    }
+    [[nodiscard]] const void* native() const { return value_ ? value_->native() : nullptr; }
 };"""
 
 

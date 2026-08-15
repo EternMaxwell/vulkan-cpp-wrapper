@@ -359,7 +359,9 @@ int main() {
     vk::DevicePrivateDataCreateInfo requested_private_slots{};
     requested_private_slots.setPrivateDataSlotRequestCount(3);
     vk::DeviceCreateInfo generated_device_info{};
-    generated_device_info.setNextInChain(requested_private_data).setNextInChain(requested_private_slots);
+    generated_device_info.setNextInChain(requested_private_data);
+    generated_device_info.nextInChain.get<vk::PhysicalDevicePrivateDataFeatures>()
+        ->setNextInChain(requested_private_slots);
     vk::DeviceCreateInfo copied_device_info = generated_device_info;
     vk::DeviceCreateInfo::CStruct copied_native{};
     copied_device_info.to_cstruct(&copied_native);

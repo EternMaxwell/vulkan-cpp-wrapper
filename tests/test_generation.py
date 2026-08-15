@@ -126,6 +126,55 @@ def test_shared_counts_never_exceed_owned_array_storage(tmp_path):
     assert "candidate != 0 && (capacity == 0 || candidate < capacity)" in alternative
 
 
+def test_non_derived_count_member_stays_explicit(tmp_path):
+    # descriptorCount is the number of descriptors in a binding, not the length
+    # of pImmutableSamplers (which is only conditionally that long), so it must
+    # stay an explicit field; viewportCount, in contrast, is a plain array
+    # length and stays derived.
+    supplemental = tmp_path / "counts.xml"
+    supplemental.write_text(
+        """<registry><types>
+      <type category="struct" name="VkBindingLike">
+        <member><type>uint32_t</type> <name>binding</name></member>
+        <member optional="true"><type>uint32_t</type> <name>descriptorCount</name></member>
+        <member noautovalidity="true" optional="true" len="descriptorCount">const <type>VkBuffer</type>* <name>pImmutableSamplers</name></member>
+      </type>
+      <type category="struct" name="VkViewportLike">
+        <member optional="true"><type>uint32_t</type> <name>viewportCount</name></member>
+        <member noautovalidity="true" optional="true" len="viewportCount">const <type>VkBuffer</type>* <name>pViewports</name></member>
+      </type>
+    </types></registry>""",
+        encoding="utf-8",
+    )
+    output = tmp_path / "wrapper.hpp"
+    assert (
+        run(
+            [
+                "--registry",
+                str(FIXTURE),
+                "--registry",
+                str(supplemental),
+                "--emit", str(ROOT / "templates" / "vulkan-header-only.template.hpp") + ":" + str(output),
+            ]
+        )
+        == 0
+    )
+    generated = output.read_text(encoding="utf-8")
+    binding = generated[generated.index("struct BindingLike {") :]
+    binding = binding[: binding.index("\n};")]
+    assert "uint32_t descriptorCount{};" in binding
+    assert "setDescriptorCount" in binding
+    binding_impl = generated[generated.index("BindingLike::to_cstruct") :]
+    binding_impl = binding_impl[: binding_impl.index("\n}")]
+    assert "descriptorCount = descriptorCount;" in binding_impl
+    viewport = generated[generated.index("struct ViewportLike {") :]
+    viewport = viewport[: viewport.index("\n};")]
+    assert "viewportCount" not in viewport
+    viewport_impl = generated[generated.index("ViewportLike::to_cstruct") :]
+    viewport_impl = viewport_impl[: viewport_impl.index("\n}")]
+    assert "viewportCount = static_cast<uint32_t>(viewports.size());" in viewport_impl
+
+
 def test_shared_command_counts_never_exceed_span_storage(tmp_path):
     supplemental = tmp_path / "commands.xml"
     supplemental.write_text(
@@ -293,13 +342,11 @@ def test_registry_constants_receive_safe_cpp_names(tmp_path):
         in generated
     )
     assert "BufferCreateInfo&& setNextInChain(T&& value) &&" in generated
-    assert "std::vector<std::unique_ptr<Value>> values_;" in generated
-    assert "values_.push_back(std::make_unique<Model" in generated
-    assert "while (tail->pNext) tail = tail->pNext;" in generated
-    assert (
-        "void refresh() { for (auto& value : values_) value->refresh(); }" in generated
-    )
+    assert "std::unique_ptr<Value> value_;" in generated
+    assert "value_ = std::make_unique<Model" in generated
+    assert "void refresh() { if (value_) value_->refresh(); }" in generated
     assert "template <typename T> [[nodiscard]] T* get() noexcept" in generated
+    assert "template <typename T> [[nodiscard]] const T* get() const noexcept" in generated
     shader = generated[generated.index("struct ShaderModuleCreateInfo {") :]
     shader = shader[: shader.index("\n};")]
     assert "size_t codeSize" not in shader
