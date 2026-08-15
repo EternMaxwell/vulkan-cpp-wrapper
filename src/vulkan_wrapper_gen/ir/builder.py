@@ -76,10 +76,15 @@ def _applies(element: ET.Element, api: str) -> bool:
 
 
 def _split_comments(element: ET.Element) -> tuple[str, str | None]:
-    """Return (declaration text without comments, joined comment text)."""
+    """Return (declaration text without comments, joined comment text).
+
+    Only *direct* ``<comment>`` children (plus the ``comment`` attribute)
+    describe the entity itself; nested comments belong to members/parameters
+    and are captured by their own ``_param`` call.
+    """
     comments = [
         (item.text or "").strip()
-        for item in element.iter()
+        for item in element
         if item.tag == "comment" and (item.text or "").strip()
     ]
     clone = deepcopy(element)

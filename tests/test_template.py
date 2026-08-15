@@ -39,7 +39,7 @@ def test_all_templates_are_validated_before_any_output_is_replaced(tmp_path):
     with pytest.raises(TemplateError, match="unknown template markers"):
         run([
             "--registry", str(FIXTURE),
-            "--template", str(good), "--output", str(first_output),
-            "--template", str(bad), "--output", str(tmp_path / "second.hpp"),
+            "--emit", str(good) + ":" + str(first_output),
+            "--emit", str(bad) + ":" + str(tmp_path / "second.hpp"),
         ])
     assert first_output.read_text(encoding="utf-8") == "unchanged"

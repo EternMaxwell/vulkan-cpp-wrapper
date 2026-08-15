@@ -56,10 +56,7 @@ def test_supplemental_structs_deep_own_nested_pointers(tmp_path):
                 str(FIXTURE),
                 "--registry",
                 str(supplemental),
-                "--template",
-                str(ROOT / "templates" / "vulkan-header-only.template.hpp"),
-                "--output",
-                str(output),
+                "--emit", str(ROOT / "templates" / "vulkan-header-only.template.hpp") + ":" + str(output),
             ]
         )
         == 0
@@ -111,10 +108,7 @@ def test_shared_counts_never_exceed_owned_array_storage(tmp_path):
                 str(FIXTURE),
                 "--registry",
                 str(supplemental),
-                "--template",
-                str(ROOT / "templates" / "vulkan-header-only.template.hpp"),
-                "--output",
-                str(output),
+                "--emit", str(ROOT / "templates" / "vulkan-header-only.template.hpp") + ":" + str(output),
             ]
         )
         == 0
@@ -155,10 +149,7 @@ def test_shared_command_counts_never_exceed_span_storage(tmp_path):
                 str(FIXTURE),
                 "--registry",
                 str(supplemental),
-                "--template",
-                str(ROOT / "templates" / "vulkan-header-only.template.hpp"),
-                "--output",
-                str(output),
+                "--emit", str(ROOT / "templates" / "vulkan-header-only.template.hpp") + ":" + str(output),
             ]
         )
         == 0
@@ -194,10 +185,7 @@ def test_single_success_multi_output_uses_expected_value(tmp_path):
                 str(FIXTURE),
                 "--registry",
                 str(supplemental),
-                "--template",
-                str(ROOT / "templates" / "vulkan-header-only.template.hpp"),
-                "--output",
-                str(output),
+                "--emit", str(ROOT / "templates" / "vulkan-header-only.template.hpp") + ":" + str(output),
             ]
         )
         == 0
@@ -224,10 +212,7 @@ def test_returned_struct_handles_use_concrete_parent_conversion(tmp_path):
                 str(headers / "registry" / "vk.xml"),
                 "--registry",
                 str(headers / "registry" / "video.xml"),
-                "--template",
-                str(ROOT / "templates" / "vulkan-header-only.template.hpp"),
-                "--output",
-                str(output),
+                "--emit", str(ROOT / "templates" / "vulkan-header-only.template.hpp") + ":" + str(output),
             ]
         )
         == 0
@@ -291,10 +276,7 @@ def test_registry_constants_receive_safe_cpp_names(tmp_path):
             [
                 "--registry",
                 str(FIXTURE),
-                "--template",
-                str(ROOT / "templates" / "vulkan-header-only.template.hpp"),
-                "--output",
-                str(output),
+                "--emit", str(ROOT / "templates" / "vulkan-header-only.template.hpp") + ":" + str(output),
             ]
         )
         == 0
@@ -344,10 +326,7 @@ def test_header_only_generation_is_deterministic(tmp_path):
     arguments = [
         "--registry",
         str(FIXTURE),
-        "--template",
-        str(ROOT / "templates" / "vulkan-header-only.template.hpp"),
-        "--output",
-        str(output),
+        "--emit", str(ROOT / "templates" / "vulkan-header-only.template.hpp") + ":" + str(output),
     ]
     assert run(arguments) == 0
     first = output.read_text(encoding="utf-8")
@@ -546,10 +525,7 @@ def test_check_reports_changed_output(tmp_path):
             [
                 "--registry",
                 str(FIXTURE),
-                "--template",
-                str(ROOT / "templates" / "vulkan-header-only.template.hpp"),
-                "--output",
-                str(output),
+                "--emit", str(ROOT / "templates" / "vulkan-header-only.template.hpp") + ":" + str(output),
                 "--check",
             ]
         )
@@ -568,14 +544,8 @@ def test_duplicate_output_is_rejected(tmp_path):
             [
                 "--registry",
                 str(FIXTURE),
-                "--template",
-                str(ROOT / "templates" / "vulkan.template.hpp"),
-                "--output",
-                str(output),
-                "--template",
-                str(ROOT / "templates" / "vulkan.template.cpp"),
-                "--output",
-                str(output),
+                "--emit", str(ROOT / "templates" / "vulkan.template.hpp") + ":" + str(output),
+                "--emit", str(ROOT / "templates" / "vulkan.template.cpp") + ":" + str(output),
             ]
         )
 
@@ -595,10 +565,7 @@ def test_unknown_config_receiver_is_rejected(tmp_path):
                 str(FIXTURE),
                 "--config",
                 str(config),
-                "--template",
-                str(ROOT / "templates" / "vulkan-header-only.template.hpp"),
-                "--output",
-                str(tmp_path / "wrapper.hpp"),
+                "--emit", str(ROOT / "templates" / "vulkan-header-only.template.hpp") + ":" + str(tmp_path / "wrapper.hpp"),
             ]
         )
 
@@ -611,14 +578,8 @@ def test_paired_templates_separate_declarations_and_implementations(tmp_path):
             [
                 "--registry",
                 str(FIXTURE),
-                "--template",
-                str(ROOT / "templates" / "vulkan.template.hpp"),
-                "--output",
-                str(header),
-                "--template",
-                str(ROOT / "templates" / "vulkan.template.cpp"),
-                "--output",
-                str(source),
+                "--emit", str(ROOT / "templates" / "vulkan.template.hpp") + ":" + str(header),
+                "--emit", str(ROOT / "templates" / "vulkan.template.cpp") + ":" + str(source),
             ]
         )
         == 0

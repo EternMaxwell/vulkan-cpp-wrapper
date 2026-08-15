@@ -45,10 +45,7 @@ def test_generated_handle_lifetimes_execute_against_fake_volk(tmp_path: Path):
                 "--vma-header",
                 str(vma / "include" / "vk_mem_alloc.h"),
                 "--clang-arg=-I" + str(headers / "include"),
-                "--template",
-                str(ROOT / "templates" / "vulkan-header-only.template.hpp"),
-                "--output",
-                str(generated),
+                "--emit", str(ROOT / "templates" / "vulkan-header-only.template.hpp") + ":" + str(generated),
             ]
         )
         == 0

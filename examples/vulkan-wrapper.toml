@@ -5,6 +5,8 @@ namespace = "vk"
 module = "vulkan.wrapper"
 api = "vulkan"
 minimum_core = "1.3"
+# Emit the registry's doc comments as /// comments on the generated entities.
+emit_docs = false
 
 [filters]
 include_extensions = ["*"]

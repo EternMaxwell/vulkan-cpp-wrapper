@@ -13,17 +13,15 @@ python -m pip install -e ".[vma]"  # only when parsing vk_mem_alloc.h
 
 ## Generate
 
-Every supplemental registry is explicit. One template maps to one output; repeat both options to render a header/source pair.
+Every supplemental registry is explicit. One template maps to one output; repeat `--emit TEMPLATE:OUTPUT` to render a header/source pair.
 
 ```console
 vulkan-wrapper-gen \
   --registry /path/to/Vulkan-Headers/registry/vk.xml \
   --registry /path/to/Vulkan-Headers/registry/video.xml \
   --config examples/vulkan-wrapper.toml \
-  --template templates/vulkan.template.hpp \
-  --output build/generated/vulkan_wrapper.hpp \
-  --template templates/vulkan.template.cpp \
-  --output build/generated/vulkan_wrapper.cpp
+  --emit templates/vulkan.template.hpp:build/generated/vulkan_wrapper.hpp \
+  --emit templates/vulkan.template.cpp:build/generated/vulkan_wrapper.cpp
 ```
 
 Header-only and module presets are available as `templates/vulkan-header-only.template.hpp` and `templates/vulkan.template.cppm`. Add `--vma-header /path/to/vk_mem_alloc.h` and repeat `--clang-arg` for include directories, platform defines, or target flags.
@@ -46,6 +44,8 @@ The injection target must be a generated C++ type. Declarations and definitions 
 ## Configuration
 
 Configuration is versioned TOML. Filters use shell-style patterns. Per-command receiver overrides can add/remove handle homes or rename methods. The generator binds a command to its dispatch handle and required scalar handle parameters by default; optional synchronization/cache handles are not inferred as receivers.
+
+Set `emit_docs = true` under `[generator]` to have the registry's doc comments emitted as `///` comments on the matching generated entities (structs and their fields, handles, commands, enums and enumerators, constants).
 
 Generated enums use scoped values and typed `Flags<Bit, NativeMask>` masks. Promoted extension type aliases and safe lower-camel registry constants are retained. Counted queries have span/count overloads plus value-returning overloads; `void` queries return `std::vector<T>`, while `VkResult` queries return `Result<std::vector<T>>` or `ResultValue<std::vector<T>>` when alternative success statuses are meaningful.
 

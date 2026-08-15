@@ -38,6 +38,18 @@ def _guard(text: str, protect: str | None) -> str:
     )
 
 
+def _doc_comment(doc: str | None, config: GeneratorConfig, indent: str = "") -> str:
+    """Render an optional doc string as a Doxygen ``///`` comment (or '').
+
+    Only emitted when ``config.emit_docs`` is enabled; whitespace is collapsed
+    so a multi-part doc reads as a single line.
+    """
+    if not config.emit_docs or not doc:
+        return ""
+    text = " ".join(doc.split())
+    return f"{indent}/// {text}\n"
+
+
 def _c_name(ir: IrRegistry, general: str) -> str | None:
     """General name -> exact C spelling by consulting every IR collection."""
     for collection in (
@@ -300,13 +312,15 @@ def _emit_enums(ir: IrRegistry, config: GeneratorConfig) -> str:
                 name += "_" + value.name.rsplit("_", 1)[-1]
             used.add(name)
             values.append(
-                _guard(
+                _doc_comment(value.doc, config, "    ")
+                + _guard(
                     f"    {name} = static_cast<{underlying}>({_enum_value(value, group)}),",
                     value.protect,
                 )
             )
         output.append(
-            _guard(
+            _doc_comment(group.doc or group.availability.doc, config)
+            + _guard(
                 f"enum class {cpp} : {underlying} {{\n" + "\n".join(values) + "\n};",
                 group.availability.protect,
             )
@@ -394,7 +408,7 @@ def _emit_aliases(ir: IrRegistry, config: GeneratorConfig) -> str:
     return "\n".join(result)
 
 
-def _emit_constants(ir: IrRegistry) -> str:
+def _emit_constants(ir: IrRegistry, config: GeneratorConfig) -> str:
     lines: list[str] = []
     emitted: set[str] = set()
     for item in ir.constants.values():
@@ -416,7 +430,10 @@ def _emit_constants(ir: IrRegistry) -> str:
             )
         else:
             continue
-        lines.append(_guard(declaration, item.protect or item.availability.protect))
+        lines.append(
+            _doc_comment(item.doc or item.availability.doc, config)
+            + _guard(declaration, item.protect or item.availability.protect)
+        )
     return "\n".join(lines)
 
 
@@ -820,12 +837,12 @@ def _emit_struct(
 ) -> str:
     name = _cpp_type(struct.name, ir, config)
     if not struct.members:
-        return _guard(
+        return _doc_comment(struct.doc or struct.availability.doc, config) + _guard(
             f"using {name} = {struct.c_name};",
             struct.protect or struct.availability.protect,
         )
     if struct.category == "union":
-        return _guard(
+        return _doc_comment(struct.doc or struct.availability.doc, config) + _guard(
             f"using {name} = {struct.c_name};",
             struct.protect or struct.availability.protect,
         )
@@ -843,17 +860,18 @@ def _emit_struct(
         if member.name not in field_names:
             continue
         field_name = field_names[member.name]
+        doc_prefix = _doc_comment(member.doc, config, "    ")
         if member.name == "sType" and member.values:
             cpp = _cpp_type(member.type, ir, config)
             lines.append(
-                f"    {cpp} {field_name}{{static_cast<{cpp}>({member.values})}};"
+                doc_prefix + f"    {cpp} {field_name}{{static_cast<{cpp}>({member.values})}};"
             )
         elif member.name == "pNext":
-            lines.append("    ExtensionChain nextInChain{};")
+            lines.append(doc_prefix + "    ExtensionChain nextInChain{};")
         else:
             member_type = _member_cpp(member, ir, config)
             lines.append(
-                f"    {member_type} {field_name}{_safe_default(member, member_type)};"
+                doc_prefix + f"    {member_type} {field_name}{_safe_default(member, member_type)};"
             )
     for member in struct.members:
         if member.name in {"sType", "pNext"} or member.name not in field_names:
@@ -889,7 +907,9 @@ def _emit_struct(
             "};",
         ]
     )
-    return _guard("\n".join(lines), struct.protect or struct.availability.protect)
+    return _doc_comment(struct.doc or struct.availability.doc, config) + _guard(
+        "\n".join(lines), struct.protect or struct.availability.protect
+    )
 
 
 def _emit_structs(
@@ -3369,14 +3389,17 @@ def _emit_handle(
             "}; }",
         ]
     )
-    lines = [
-        "\n".join(state_lines),
-        f"class {name} {{",
-        "  public:",
-        f"    using native_type = {handle.c_name};",
-        "  private:",
-        "    native_type native_{};",
-    ]
+    lines = ["\n".join(state_lines)]
+    handle_doc = _doc_comment(handle.doc or handle.availability.doc, config)
+    lines.append(f"{handle_doc}class {name} {{" if handle_doc else f"class {name} {{")
+    lines.extend(
+        [
+            "  public:",
+            f"    using native_type = {handle.c_name};",
+            "  private:",
+            "    native_type native_{};",
+        ]
+    )
     if parent:
         lines.append(f"    mutable {parent} parent_{{}};")
     else:
@@ -3516,7 +3539,8 @@ def _emit_handle(
         key = (method_name, declaration)
         if key not in seen:
             lines.append(
-                _guard(
+                _doc_comment(command.doc or command.availability.doc, config, "    ")
+                + _guard(
                     declaration,
                     command.protect or command.availability.protect,
                 )
@@ -4528,7 +4552,7 @@ def emit_sections(
         + _emit_command_result_forwards(ir),
         "result_code": _emit_result_code(ir),
         "aliases": _emit_aliases(ir, config),
-        "constants": _emit_constants(ir),
+        "constants": _emit_constants(ir, config),
         "enums": _emit_enums(ir, config),
         "runtime_declarations": PRELUDE + "\n" + RUNTIME,
         "runtime_implementations": "",

@@ -12,6 +12,23 @@ from .template import TemplateError, atomic_write, load_template, render_templat
 from .vma import VmaError, parse_vma_header
 
 
+def _split_emit_spec(spec: str) -> tuple[Path, Path]:
+    """Split an ``--emit`` ``TEMPLATE:OUTPUT`` argument.
+
+    Windows drive letters (``C:``) are tolerated at the start of the template
+    path; the separator is the first ``:`` that is not a drive letter.
+    """
+    for index, char in enumerate(spec):
+        if char == ":":
+            if index == 1 and spec[0].isalpha():
+                continue  # drive letter (e.g. C:\...)
+            template, output = spec[:index], spec[index + 1:]
+            if not template or not output:
+                break
+            return Path(template), Path(output)
+    raise TemplateError(f"--emit must be TEMPLATE:OUTPUT, got {spec!r}")
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="vulkan-wrapper-gen",
@@ -23,10 +40,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--clang-arg", action="append", default=[], help="Argument forwarded to libclang")
     parser.add_argument("--config", type=Path, help="Versioned TOML generator configuration")
     parser.add_argument("--namespace", help="Override the configured C++ namespace")
-    parser.add_argument("--template", action="append", type=Path,
-                        help="Marker template input; repeat with matching --output")
-    parser.add_argument("--output", action="append", type=Path,
-                        help="Generated output path; repeat with matching --template")
+    parser.add_argument("--emit", action="append", metavar="TEMPLATE:OUTPUT",
+                        help="Render TEMPLATE to OUTPUT; repeat for a header/source pair")
     parser.add_argument("--emit-ir", type=Path,
                         help="Write the processed middle-layer IR as JSON and exit")
     parser.add_argument("--check", action="store_true",
@@ -64,11 +79,10 @@ def run(arguments: list[str] | None = None) -> int:
         atomic_write(args.emit_ir, ir.to_json(indent=2) + "\n")
         print(f"generated {args.emit_ir}")
         return 0
-    if not args.template or not args.output:
-        raise TemplateError("at least one --template/--output pair or --emit-ir is required")
-    if len(args.template) != len(args.output):
-        raise TemplateError("each --template must have exactly one matching --output")
-    resolved_outputs = [path.resolve() for path in args.output]
+    if not args.emit:
+        raise TemplateError("at least one --emit or --emit-ir is required")
+    pairs = [_split_emit_spec(spec) for spec in args.emit]
+    resolved_outputs = [output.resolve() for _, output in pairs]
     duplicates = sorted({str(path) for path in resolved_outputs if resolved_outputs.count(path) > 1})
     if duplicates:
         raise TemplateError(f"duplicate output paths: {', '.join(duplicates)}")
@@ -98,7 +112,7 @@ def run(arguments: list[str] | None = None) -> int:
     # Validate every template before replacing any output. Individual file
     # replacement is atomic; a malformed later template cannot partially
     # update an otherwise paired invocation.
-    for template_path, output_path in zip(args.template, args.output, strict=True):
+    for template_path, output_path in pairs:
         template = load_template(template_path)
         sections = emit_sections(ir, config, template, vma)
         rendered_outputs.append((output_path, render_template(template, sections, known_types)))
