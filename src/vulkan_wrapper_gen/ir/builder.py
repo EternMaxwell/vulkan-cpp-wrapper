@@ -346,7 +346,13 @@ def _receiver_member_name(cpp_name: str, receiver: str, config: GeneratorConfig)
     index = pascal.find(receiver_name)
     if index < 0:
         return cpp_name
-    shortened = pascal[:index] + pascal[index + len(receiver_name):]
+    head = pascal[:index]
+    tail = pascal[index + len(receiver_name):]
+    # A plural receiver leaves a stray trailing 's' after stripping the singular
+    # name ("vkMergePipelineCaches" -> "merge", not "merges").
+    if tail.startswith("s"):
+        tail = tail[1:]
+    shortened = head + tail
     if not shortened:
         return cpp_name
     return shortened[:1].lower() + shortened[1:]
@@ -870,6 +876,32 @@ def _finalize(registry: IrRegistry, config: GeneratorConfig) -> None:
             command.active = False
 
     overrides = config.receivers
+    # The dispatch handle that hosts each handle's create command. A handle is
+    # owned by exactly one dispatch handle when every create command producing
+    # it is hosted on that same handle; commands that operate on such a handle
+    # as their second, non-optional parameter are rehomed onto it (the
+    # Vulkan-Hpp "second-level command" rule: vkGetPipelineCacheData lives on
+    # PipelineCache, vkGetQueryPoolResults on QueryPool, etc.).
+    constructor_host: dict[str, str | None] = {}
+    for handle in registry.handles.values():
+        if not handle.active:
+            continue
+        hosts: set[str] = set()
+        for command in registry.commands.values():
+            if (
+                not command.active
+                or command.alias_of
+                or not command.c_name.startswith(("vkCreate", "vkAllocate"))
+            ):
+                continue
+            if not any(
+                param.type == handle.name and param.direction == "output"
+                for param in command.params
+            ):
+                continue
+            if command.params and command.params[0].type in active_handles:
+                hosts.add(command.params[0].type)
+        constructor_host[handle.name] = next(iter(hosts)) if len(hosts) == 1 else None
     for command in registry.commands.values():
         if not command.active:
             continue
@@ -879,12 +911,22 @@ def _finalize(registry: IrRegistry, config: GeneratorConfig) -> None:
             if command.params and command.params[0].type in active_handles
             else None
         )
-        # Receivers: only the dispatch handle.  Each command lives in exactly
-        # one wrapper (or Context when receiver-less); additional homes are
-        # requested explicitly through the receivers configuration.
+        # Receivers: the dispatch handle by default, or the second non-optional
+        # handle when it is owned by the dispatch handle. Each command lives in
+        # exactly one wrapper (or Context when receiver-less); additional homes
+        # are requested explicitly through the receivers configuration.
+        default_receiver = command.dispatch
+        if (
+            command.dispatch
+            and len(command.params) > 1
+            and command.params[1].type in active_handles
+            and not command.params[1].is_optional
+            and constructor_host.get(command.params[1].type) == command.dispatch
+        ):
+            default_receiver = command.params[1].type
         receivers: list[str] = []
-        if command.dispatch:
-            receivers.append(command.dispatch)
+        if default_receiver:
+            receivers.append(default_receiver)
         override = overrides.get(command.c_name)
         if override:
             receivers = [value for value in receivers if value not in override.remove]

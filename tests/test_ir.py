@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 from vulkan_wrapper_gen.ir import IrRegistry, build_ir
+from vulkan_wrapper_gen.ir.builder import _receiver_member_name
 from vulkan_wrapper_gen.config import GeneratorConfig
 
 FIXTURE = Path(__file__).parent / "fixtures" / "mini_vk.xml"
@@ -251,3 +252,12 @@ def test_full_registry_builds_and_survives_roundtrip():
     assert registry.handles["Buffer"].c_name == "VkBuffer"
     restored = IrRegistry.from_json(registry.to_json())
     assert restored.to_dict() == registry.to_dict()
+
+
+def test_receiver_member_name_strips_receiver_and_plural_s():
+    config = GeneratorConfig()
+    assert _receiver_member_name("getPipelineCacheData", "PipelineCache", config) == "getData"
+    assert _receiver_member_name("getQueryPoolResults", "QueryPool", config) == "getResults"
+    assert _receiver_member_name("getFenceStatus", "Fence", config) == "getStatus"
+    assert _receiver_member_name("bindBufferMemory", "Buffer", config) == "bindMemory"
+    assert _receiver_member_name("mergePipelineCaches", "PipelineCache", config) == "merge"

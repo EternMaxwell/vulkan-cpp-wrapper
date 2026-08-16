@@ -125,12 +125,12 @@ int main() {
              .setSharingMode(vk::SharingMode::Exclusive)
              .setInitialLayout(vk::ImageLayout::Undefined);
     auto textureImage = device->createImage(imageInfo, std::nullopt);
-    auto textureReqs = device->getImageMemoryRequirements(*textureImage);
+    auto textureReqs = textureImage->getMemoryRequirements();
     auto textureMemory = device->allocateMemory(
         vk::MemoryAllocateInfo{}.setAllocationSize(textureReqs.size)
             .setMemoryTypeIndex(find_memory_type(physical, deviceFlags)), std::nullopt);
     if (!textureImage || !textureMemory ||
-        !device->bindImageMemory(*textureImage, *textureMemory, 0)) {
+        !textureImage->bindMemory(*textureMemory, 0)) {
         std::println(stderr, "texture image setup failed"); return 1;
     }
 
@@ -138,19 +138,19 @@ int main() {
         vk::BufferCreateInfo{}.setSize(texels.size())
             .setUsage(vk::BufferUsageFlagBits::TransferSrc)
             .setSharingMode(vk::SharingMode::Exclusive), std::nullopt);
-    auto stagingReqs = device->getBufferMemoryRequirements(*staging);
+    auto stagingReqs = staging->getMemoryRequirements();
     auto stagingMemory = device->allocateMemory(
         vk::MemoryAllocateInfo{}.setAllocationSize(stagingReqs.size)
             .setMemoryTypeIndex(find_memory_type(physical, hostFlags)), std::nullopt);
-    if (!staging || !stagingMemory || !device->bindBufferMemory(*staging, *stagingMemory, 0)) {
+    if (!staging || !stagingMemory || !staging->bindMemory(*stagingMemory, 0)) {
         std::println(stderr, "staging buffer setup failed"); return 1;
     }
     void* mapped = nullptr;
-    if (!device->mapMemory(*stagingMemory, 0, texels.size(), vk::MemoryMapFlags{}, &mapped)) {
+    if (!stagingMemory->mapMemory(0, texels.size(), vk::MemoryMapFlags{}, &mapped)) {
         std::println(stderr, "mapMemory failed"); return 1;
     }
     std::memcpy(mapped, texels.data(), texels.size());
-    device->unmapMemory(*stagingMemory);
+    stagingMemory->unmapMemory();
 
     // Sampler + image view for sampling.
     vk::SamplerCreateInfo samplerInfo{};
@@ -181,19 +181,19 @@ int main() {
         vk::BufferCreateInfo{}.setSize(8)
             .setUsage(vk::BufferUsageFlagBits::UniformBuffer)
             .setSharingMode(vk::SharingMode::Exclusive), std::nullopt);
-    auto uboReqs = device->getBufferMemoryRequirements(*ubo);
+    auto uboReqs = ubo->getMemoryRequirements();
     auto uboMemory = device->allocateMemory(
         vk::MemoryAllocateInfo{}.setAllocationSize(uboReqs.size)
             .setMemoryTypeIndex(find_memory_type(physical, hostFlags)), std::nullopt);
-    if (!ubo || !uboMemory || !device->bindBufferMemory(*ubo, *uboMemory, 0)) {
+    if (!ubo || !uboMemory || !ubo->bindMemory(*uboMemory, 0)) {
         std::println(stderr, "ubo setup failed"); return 1;
     }
     float offset[2] = {0.0f, 0.0f};
-    if (!device->mapMemory(*uboMemory, 0, 8, vk::MemoryMapFlags{}, &mapped)) {
+    if (!uboMemory->mapMemory(0, 8, vk::MemoryMapFlags{}, &mapped)) {
         std::println(stderr, "ubo map failed"); return 1;
     }
     std::memcpy(mapped, offset, sizeof(offset));
-    device->unmapMemory(*uboMemory);
+    uboMemory->unmapMemory();
 
     vk::DescriptorSetLayoutBinding uboBinding{};
     uboBinding.setBinding(0).setDescriptorType(vk::DescriptorType::UniformBuffer)
@@ -251,34 +251,34 @@ int main() {
     auto vertexBuffer = device->createBuffer(
         vk::BufferCreateInfo{}.setSize(vertices.size() * sizeof(Vertex))
             .setUsage(vk::BufferUsageFlagBits::VertexBuffer), std::nullopt);
-    auto vertexReqs = device->getBufferMemoryRequirements(*vertexBuffer);
+    auto vertexReqs = vertexBuffer->getMemoryRequirements();
     auto vertexMemory = device->allocateMemory(
         vk::MemoryAllocateInfo{}.setAllocationSize(vertexReqs.size)
             .setMemoryTypeIndex(find_memory_type(physical, hostFlags)), std::nullopt);
-    if (!vertexBuffer || !vertexMemory || !device->bindBufferMemory(*vertexBuffer, *vertexMemory, 0)) {
+    if (!vertexBuffer || !vertexMemory || !vertexBuffer->bindMemory(*vertexMemory, 0)) {
         std::println(stderr, "vertex buffer setup failed"); return 1;
     }
-    if (!device->mapMemory(*vertexMemory, 0, vertices.size() * sizeof(Vertex), vk::MemoryMapFlags{}, &mapped)) {
+    if (!vertexMemory->mapMemory(0, vertices.size() * sizeof(Vertex), vk::MemoryMapFlags{}, &mapped)) {
         std::println(stderr, "vertex map failed"); return 1;
     }
     std::memcpy(mapped, vertices.data(), vertices.size() * sizeof(Vertex));
-    device->unmapMemory(*vertexMemory);
+    vertexMemory->unmapMemory();
 
     auto indexBuffer = device->createBuffer(
         vk::BufferCreateInfo{}.setSize(indices.size() * sizeof(std::uint16_t))
             .setUsage(vk::BufferUsageFlagBits::IndexBuffer), std::nullopt);
-    auto indexReqs = device->getBufferMemoryRequirements(*indexBuffer);
+    auto indexReqs = indexBuffer->getMemoryRequirements();
     auto indexMemory = device->allocateMemory(
         vk::MemoryAllocateInfo{}.setAllocationSize(indexReqs.size)
             .setMemoryTypeIndex(find_memory_type(physical, hostFlags)), std::nullopt);
-    if (!indexBuffer || !indexMemory || !device->bindBufferMemory(*indexBuffer, *indexMemory, 0)) {
+    if (!indexBuffer || !indexMemory || !indexBuffer->bindMemory(*indexMemory, 0)) {
         std::println(stderr, "index buffer setup failed"); return 1;
     }
-    if (!device->mapMemory(*indexMemory, 0, indices.size() * sizeof(std::uint16_t), vk::MemoryMapFlags{}, &mapped)) {
+    if (!indexMemory->mapMemory(0, indices.size() * sizeof(std::uint16_t), vk::MemoryMapFlags{}, &mapped)) {
         std::println(stderr, "index map failed"); return 1;
     }
     std::memcpy(mapped, indices.data(), indices.size() * sizeof(std::uint16_t));
-    device->unmapMemory(*indexMemory);
+    indexMemory->unmapMemory();
 
     // ------------------------------------------------------------------
     // Offscreen color target + pipeline + command buffer.
@@ -294,11 +294,11 @@ int main() {
               .setSharingMode(vk::SharingMode::Exclusive)
               .setInitialLayout(vk::ImageLayout::Undefined);
     auto targetImage = device->createImage(targetInfo, std::nullopt);
-    auto targetReqs = device->getImageMemoryRequirements(*targetImage);
+    auto targetReqs = targetImage->getMemoryRequirements();
     auto targetMemory = device->allocateMemory(
         vk::MemoryAllocateInfo{}.setAllocationSize(targetReqs.size)
             .setMemoryTypeIndex(find_memory_type(physical, deviceFlags)), std::nullopt);
-    if (!targetImage || !targetMemory || !device->bindImageMemory(*targetImage, *targetMemory, 0)) {
+    if (!targetImage || !targetMemory || !targetImage->bindMemory(*targetMemory, 0)) {
         std::println(stderr, "target image setup failed"); return 1;
     }
     auto targetView = device->createImageView(
@@ -445,11 +445,11 @@ int main() {
     auto readbackBuffer = device->createBuffer(
         vk::BufferCreateInfo{}.setSize(readbackSize)
             .setUsage(vk::BufferUsageFlagBits::TransferDst), std::nullopt);
-    auto readbackReqs = device->getBufferMemoryRequirements(*readbackBuffer);
+    auto readbackReqs = readbackBuffer->getMemoryRequirements();
     auto readbackMemory = device->allocateMemory(
         vk::MemoryAllocateInfo{}.setAllocationSize(readbackReqs.size)
             .setMemoryTypeIndex(find_memory_type(physical, hostFlags)), std::nullopt);
-    if (!readbackBuffer || !readbackMemory || !device->bindBufferMemory(*readbackBuffer, *readbackMemory, 0)) {
+    if (!readbackBuffer || !readbackMemory || !readbackBuffer->bindMemory(*readbackMemory, 0)) {
         std::println(stderr, "readback buffer failed"); return 1;
     }
     auto copyCmd = commandBuffers.value()[0];
@@ -470,7 +470,7 @@ int main() {
     if (!queue.submit(std::array{copySubmit}, vk::Fence{}) || !device->waitIdle()) {
         std::println(stderr, "readback submit failed"); return 1;
     }
-    if (!device->mapMemory(*readbackMemory, 0, readbackSize, vk::MemoryMapFlags{}, &mapped)) {
+    if (!readbackMemory->mapMemory(0, readbackSize, vk::MemoryMapFlags{}, &mapped)) {
         std::println(stderr, "readback map failed"); return 1;
     }
     const auto* bytes = static_cast<const std::uint8_t*>(mapped);
@@ -482,7 +482,7 @@ int main() {
     auto tr = pixel(600, 150);
     auto bl = pixel(200, 450);
     auto br = pixel(600, 450);
-    device->unmapMemory(*readbackMemory);
+    readbackMemory->unmapMemory();
 
     auto closeTo = [](const std::array<std::uint8_t, 4>& p, std::array<int, 4> want) {
         for (int i = 0; i < 4; ++i) if (std::abs(static_cast<int>(p[i]) - want[i]) > 24) return false;

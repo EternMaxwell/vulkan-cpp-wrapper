@@ -486,14 +486,14 @@ int main() {
     // owned handles store typed user data in their single control block.
     auto pure_borrow = vk::Buffer::borrow(fake_handle<VkBuffer>(0x4100), *device);
     assert(pure_borrow && pure_borrow->use_count() == 0);
-    assert(!pure_borrow->setData<int>(std::make_shared<const int>(9)));
+    assert(!pure_borrow->setUserData<int>(std::make_shared<const int>(9)));
     int observer_destroys = 0;
     auto observer = vk::Buffer::adopt(
         fake_handle<VkBuffer>(0x4100), *device,
         [&](VkBuffer) noexcept { ++observer_destroys; }, {});
     assert(observer && observer->use_count() == 1);
-    assert(observer->setData<int>(std::make_shared<const int>(7)));
-    assert(*observer->getData<int>() == 7);
+    assert(observer->setUserData<int>(std::make_shared<const int>(7)));
+    assert(*observer->getUserData<int>() == 7);
     observer->reset();
     assert(observer_destroys == 1);
     pure_borrow->reset();

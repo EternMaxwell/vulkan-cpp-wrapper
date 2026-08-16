@@ -3811,9 +3811,9 @@ def _emit_handle(
         )
     lines.extend(
         [
-            "    template <typename T> [[nodiscard]] Result<void> setData(std::shared_ptr<const T> value) const;",
-            "    template <typename T> [[nodiscard]] std::shared_ptr<const T> getData() const noexcept;",
-            "    template <typename T> void clearData() const noexcept;",
+            "    template <typename T> [[nodiscard]] Result<void> setUserData(std::shared_ptr<const T> value) const;",
+            "    template <typename T> [[nodiscard]] std::shared_ptr<const T> getUserData() const noexcept;",
+            "    template <typename T> void clearUserData() const noexcept;",
         ]
     )
     adoption = f", const {parent}& parent" if parent else ""
@@ -4295,9 +4295,9 @@ def _emit_handle_template_implementations(
             continue
         name = _cpp_type(handle.name, ir, config)
         definitions = [
-            f"template <typename T> inline Result<void> {name}::setData(std::shared_ptr<const T> value) const {{ if (!ctrl_) return std::unexpected(ResultCode::ErrorUnknown); std::unique_lock lock(ctrl_->externsync); try {{ if (!ctrl_->data) ctrl_->data = std::make_unique<std::unordered_map<std::type_index, std::shared_ptr<const void>>>(); ctrl_->data->insert_or_assign(typeid(T), std::move(value)); }} catch (...) {{ return std::unexpected(ResultCode::ErrorOutOfHostMemory); }} return {{}}; }}",
-            f"template <typename T> inline std::shared_ptr<const T> {name}::getData() const noexcept {{ if (!ctrl_) return nullptr; std::shared_lock lock(ctrl_->externsync); if (!ctrl_->data) return nullptr; auto found = ctrl_->data->find(typeid(T)); return found == ctrl_->data->end() ? nullptr : std::static_pointer_cast<const T>(found->second); }}",
-            f"template <typename T> inline void {name}::clearData() const noexcept {{ if (!ctrl_) return; std::unique_lock lock(ctrl_->externsync); if (ctrl_->data) ctrl_->data->erase(typeid(T)); }}",
+            f"template <typename T> inline Result<void> {name}::setUserData(std::shared_ptr<const T> value) const {{ if (!ctrl_) return std::unexpected(ResultCode::ErrorUnknown); std::unique_lock lock(ctrl_->externsync); try {{ if (!ctrl_->data) ctrl_->data = std::make_unique<std::unordered_map<std::type_index, std::shared_ptr<const void>>>(); ctrl_->data->insert_or_assign(typeid(T), std::move(value)); }} catch (...) {{ return std::unexpected(ResultCode::ErrorOutOfHostMemory); }} return {{}}; }}",
+            f"template <typename T> inline std::shared_ptr<const T> {name}::getUserData() const noexcept {{ if (!ctrl_) return nullptr; std::shared_lock lock(ctrl_->externsync); if (!ctrl_->data) return nullptr; auto found = ctrl_->data->find(typeid(T)); return found == ctrl_->data->end() ? nullptr : std::static_pointer_cast<const T>(found->second); }}",
+            f"template <typename T> inline void {name}::clearUserData() const noexcept {{ if (!ctrl_) return; std::unique_lock lock(ctrl_->externsync); if (ctrl_->data) ctrl_->data->erase(typeid(T)); }}",
         ]
         result.append(
             _guard(

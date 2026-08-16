@@ -563,13 +563,12 @@ def test_externsync_shared_locks_and_config_option(tmp_path):
         == 0
     )
     generated = output.read_text(encoding="utf-8")
-    use_buffer = generated[generated.index("inline void Device::useBufferEXT") :]
+    use_buffer = generated[generated.index("inline void Buffer::useEXT") :]
     use_buffer = use_buffer[: use_buffer.index("\n}")]
-    # The externsync'd buffer gets an exclusive lock; the receiver and the
-    # non-externsync input handle (fence) get shared locks so they serialize
+    # The externsync'd buffer (bound to *this) gets an exclusive lock; the
+    # non-externsync input handle (fence) gets a shared lock so it serializes
     # against the exclusive one.
-    assert "collect(buffer, true, externsync_states)" in use_buffer
-    assert "collect(*this, false, externsync_states)" in use_buffer
+    assert "collect(*this, true, externsync_states)" in use_buffer
     assert "collect(fence, false, externsync_states)" in use_buffer
 
     # Disabling externsync in the config drops the lock machinery from commands.
@@ -607,6 +606,31 @@ def test_externsync_shared_locks_and_config_option(tmp_path):
     )
     flagged_text = flagged.read_text(encoding="utf-8")
     assert "externsync_states" not in flagged_text
+
+
+def test_commands_rehome_to_owned_second_handle(tmp_path):
+    output = tmp_path / "wrapper.hpp"
+    assert (
+        run(
+            [
+                "--registry",
+                str(FIXTURE),
+                "--emit", str(ROOT / "templates" / "vulkan-header-only.template.hpp") + ":" + str(output),
+            ]
+        )
+        == 0
+    )
+    generated = output.read_text(encoding="utf-8")
+    # vkUseBufferEXT(device, buffer, fence): buffer is a non-optional handle
+    # owned by device, so the command rehomes onto Buffer (Vulkan-Hpp rule).
+    assert "void Buffer::useEXT(" in generated
+    assert "void Device::useBufferEXT(" not in generated
+    # vkCreateGraphicsPipelines keeps pipelineCache optional, so it stays on the
+    # dispatch handle.
+    assert "Device::createGraphicsPipelines" in generated
+    assert "PipelineCache::createGraphicsPipelines" not in generated
+    # vkQueueSubmit's first parameter is the queue itself, so no rehome.
+    assert "Queue::submit(" in generated
 
 
 FIXTURE = ROOT / "tests" / "fixtures" / "mini_vk.xml"
@@ -887,10 +911,10 @@ def test_paired_templates_separate_declarations_and_implementations(tmp_path):
     assert "Result<void> createBuffer(" in declarations
     assert "Device::createBuffer(" not in declarations
     assert "void BufferCreateInfo::to_cstruct" not in declarations
-    assert "template <typename T> inline Result<void> Buffer::setData" in declarations
-    assert "void Device::useBufferEXT(" in implementations
+    assert "template <typename T> inline Result<void> Buffer::setUserData" in declarations
+    assert "void Buffer::useEXT(" in implementations
     assert "void BufferCreateInfo::to_cstruct" in implementations
     assert (
-        "template <typename T> inline Result<void> Buffer::setData"
+        "template <typename T> inline Result<void> Buffer::setUserData"
         not in implementations
     )

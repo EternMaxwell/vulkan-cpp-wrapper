@@ -131,8 +131,8 @@ int main() {
             .setSharingMode(vk::SharingMode::Exclusive), std::nullopt);
     if (!inputBuffer || !outputBuffer) { std::println(stderr, "createBuffer failed"); return 1; }
 
-    auto inputReqs = device->getBufferMemoryRequirements(*inputBuffer);
-    auto outputReqs = device->getBufferMemoryRequirements(*outputBuffer);
+    auto inputReqs = inputBuffer->getMemoryRequirements();
+    auto outputReqs = outputBuffer->getMemoryRequirements();
     auto inputMemory = device->allocateMemory(
         vk::MemoryAllocateInfo{}.setAllocationSize(inputReqs.size)
             .setMemoryTypeIndex(find_memory_type(physical, hostFlags)), std::nullopt);
@@ -140,18 +140,18 @@ int main() {
         vk::MemoryAllocateInfo{}.setAllocationSize(outputReqs.size)
             .setMemoryTypeIndex(find_memory_type(physical, hostFlags)), std::nullopt);
     if (!inputMemory || !outputMemory ||
-        !device->bindBufferMemory(*inputBuffer, *inputMemory, 0) ||
-        !device->bindBufferMemory(*outputBuffer, *outputMemory, 0)) {
+        !inputBuffer->bindMemory(*inputMemory, 0) ||
+        !outputBuffer->bindMemory(*outputMemory, 0)) {
         std::println(stderr, "buffer memory setup failed"); return 1;
     }
 
     void* mapped = nullptr;
-    if (!device->mapMemory(*inputMemory, 0, size, vk::MemoryMapFlags{}, &mapped)) {
+    if (!inputMemory->mapMemory(0, size, vk::MemoryMapFlags{}, &mapped)) {
         std::println(stderr, "mapMemory (input) failed"); return 1;
     }
     auto* input = static_cast<float*>(mapped);
     for (std::uint32_t i = 0; i < kCount; ++i) input[i] = static_cast<float>(i);
-    device->unmapMemory(*inputMemory);
+    inputMemory->unmapMemory();
 
     // Descriptor pool + set.
     vk::DescriptorPoolSize poolSize{};
@@ -218,7 +218,7 @@ int main() {
     }
 
     // Read back and verify.
-    if (!device->mapMemory(*outputMemory, 0, size, vk::MemoryMapFlags{}, &mapped)) {
+    if (!outputMemory->mapMemory(0, size, vk::MemoryMapFlags{}, &mapped)) {
         std::println(stderr, "mapMemory (output) failed"); return 1;
     }
     const auto* output = static_cast<const float*>(mapped);
@@ -228,7 +228,7 @@ int main() {
         float expected = static_cast<float>(i) * 2.0f;
         if (std::fabs(output[i] - expected) > 1e-4f) { ok = false; firstBad = static_cast<int>(i); break; }
     }
-    device->unmapMemory(*outputMemory);
+    outputMemory->unmapMemory();
 
     if (!ok) {
         std::println(stderr, "FAIL: compute verification failed at index {}: {} != {}",

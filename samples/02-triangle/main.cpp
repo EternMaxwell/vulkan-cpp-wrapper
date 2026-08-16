@@ -232,7 +232,7 @@ int main() {
            .setPresentMode(vk::PresentModeKHR::Fifo);
     auto swapchain = device->createSwapchainKHR(swapInfo, std::nullopt);
     if (!swapchain) { std::println(stderr, "createSwapchainKHR failed"); return 1; }
-    auto swapImages = device->getSwapchainImagesKHR(*swapchain);
+    auto swapImages = swapchain->getSwapchainImagesKHR();
     if (swapImages.status != vk::ResultCode::Success) {
         std::println(stderr, "getSwapchainImagesKHR failed"); return 1;
     }
@@ -298,21 +298,21 @@ int main() {
             .setUsage(vk::BufferUsageFlagBits::VertexBuffer)
             .setSharingMode(vk::SharingMode::Exclusive), std::nullopt);
     if (!vertexBuffer) { std::println(stderr, "createBuffer failed"); return 1; }
-    auto vbReqs = device->getBufferMemoryRequirements(*vertexBuffer);
+    auto vbReqs = vertexBuffer->getMemoryRequirements();
     auto vertexMemory = device->allocateMemory(
         vk::MemoryAllocateInfo{}.setAllocationSize(vbReqs.size)
             .setMemoryTypeIndex(find_memory_type(physical,
                 vk::MemoryPropertyFlagBits::HostVisible | vk::MemoryPropertyFlagBits::HostCoherent)), std::nullopt);
     if (!vertexMemory) { std::println(stderr, "allocateMemory failed"); return 1; }
-    if (!device->bindBufferMemory(*vertexBuffer, *vertexMemory, 0)) {
+    if (!vertexBuffer->bindMemory(*vertexMemory, 0)) {
         std::println(stderr, "bindBufferMemory failed"); return 1;
     }
     void* mapped = nullptr;
-    if (!device->mapMemory(*vertexMemory, 0, vbSize, vk::MemoryMapFlags{}, &mapped)) {
+    if (!vertexMemory->mapMemory(0, vbSize, vk::MemoryMapFlags{}, &mapped)) {
         std::println(stderr, "mapMemory failed"); return 1;
     }
     std::memcpy(mapped, vertices.data(), static_cast<std::size_t>(vbSize));
-    device->unmapMemory(*vertexMemory);
+    vertexMemory->unmapMemory();
 
     // Command pool + per-frame command buffers.
     auto commandPool = device->createCommandPool(
@@ -352,8 +352,8 @@ int main() {
         if (!device->resetFences(std::array{*inFlight})) {
             std::println(stderr, "resetFences failed"); return 1;
         }
-        auto acquired = device->acquireNextImageKHR(
-            *swapchain, UINT64_MAX, *imageAvailable, vk::Fence{});
+        auto acquired = swapchain->acquireNextImageKHR(
+            UINT64_MAX, *imageAvailable, vk::Fence{});
         if (acquired.status == vk::ResultCode::ErrorOutOfDateKhr) {
             std::println(stderr, "acquire out-of-date (resize not implemented)"); break;
         }
@@ -410,12 +410,12 @@ int main() {
              .setInitialLayout(vk::ImageLayout::Undefined);
     auto offscreenImage = device->createImage(imageInfo, std::nullopt);
     if (!offscreenImage) { std::println(stderr, "offscreen createImage failed"); return 1; }
-    auto imageReqs = device->getImageMemoryRequirements(*offscreenImage);
+    auto imageReqs = offscreenImage->getMemoryRequirements();
     auto offscreenMemory = device->allocateMemory(
         vk::MemoryAllocateInfo{}.setAllocationSize(imageReqs.size)
             .setMemoryTypeIndex(find_memory_type(physical,
                 vk::MemoryPropertyFlagBits::DeviceLocal)), std::nullopt);
-    if (!offscreenMemory || !device->bindImageMemory(*offscreenImage, *offscreenMemory, 0)) {
+    if (!offscreenMemory || !offscreenImage->bindMemory(*offscreenMemory, 0)) {
         std::println(stderr, "offscreen memory bind failed"); return 1;
     }
     auto offscreenView = device->createImageView(
@@ -453,13 +453,13 @@ int main() {
         vk::BufferCreateInfo{}.setSize(readbackSize)
             .setUsage(vk::BufferUsageFlagBits::TransferDst)
             .setSharingMode(vk::SharingMode::Exclusive), std::nullopt);
-    auto readbackReqs = device->getBufferMemoryRequirements(*readbackBuffer);
+    auto readbackReqs = readbackBuffer->getMemoryRequirements();
     auto readbackMemory = device->allocateMemory(
         vk::MemoryAllocateInfo{}.setAllocationSize(readbackReqs.size)
             .setMemoryTypeIndex(find_memory_type(physical,
                 vk::MemoryPropertyFlagBits::HostVisible | vk::MemoryPropertyFlagBits::HostCoherent)), std::nullopt);
     if (!readbackBuffer || !readbackMemory ||
-        !device->bindBufferMemory(*readbackBuffer, *readbackMemory, 0)) {
+        !readbackBuffer->bindMemory(*readbackMemory, 0)) {
         std::println(stderr, "readback buffer setup failed"); return 1;
     }
 
@@ -485,7 +485,7 @@ int main() {
     }
 
     void* pixels = nullptr;
-    if (!device->mapMemory(*readbackMemory, 0, readbackSize, vk::MemoryMapFlags{}, &pixels)) {
+    if (!readbackMemory->mapMemory(0, readbackSize, vk::MemoryMapFlags{}, &pixels)) {
         std::println(stderr, "readback mapMemory failed"); return 1;
     }
     const auto* bytes = static_cast<const std::uint8_t*>(pixels);
@@ -496,7 +496,7 @@ int main() {
     };
     auto center = pixel(kWidth / 2, kHeight / 2);
     auto corner = pixel(4, 4);
-    device->unmapMemory(*readbackMemory);
+    readbackMemory->unmapMemory();
 
     // Triangle interior is red (1,0,0,1) -> B8G8R8A8 {0,0,255,255}.
     // Clear color is blue (0,0,1,1) -> B8G8R8A8 {255,0,0,255}.

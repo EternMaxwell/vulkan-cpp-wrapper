@@ -113,19 +113,19 @@ int main() {
     auto vertexBuffer = device->createBuffer(
         vk::BufferCreateInfo{}.setSize(vertices.size() * sizeof(Vertex))
             .setUsage(vk::BufferUsageFlagBits::VertexBuffer), std::nullopt);
-    auto vertexReqs = device->getBufferMemoryRequirements(*vertexBuffer);
+    auto vertexReqs = vertexBuffer->getMemoryRequirements();
     auto vertexMemory = device->allocateMemory(
         vk::MemoryAllocateInfo{}.setAllocationSize(vertexReqs.size)
             .setMemoryTypeIndex(find_memory_type(physical, hostFlags)), std::nullopt);
-    if (!vertexBuffer || !vertexMemory || !device->bindBufferMemory(*vertexBuffer, *vertexMemory, 0)) {
+    if (!vertexBuffer || !vertexMemory || !vertexBuffer->bindMemory(*vertexMemory, 0)) {
         std::println(stderr, "vertex buffer failed"); return 1;
     }
     void* mapped = nullptr;
-    if (!device->mapMemory(*vertexMemory, 0, vertices.size() * sizeof(Vertex), vk::MemoryMapFlags{}, &mapped)) {
+    if (!vertexMemory->mapMemory(0, vertices.size() * sizeof(Vertex), vk::MemoryMapFlags{}, &mapped)) {
         std::println(stderr, "vertex map failed"); return 1;
     }
     std::memcpy(mapped, vertices.data(), vertices.size() * sizeof(Vertex));
-    device->unmapMemory(*vertexMemory);
+    vertexMemory->unmapMemory();
 
     // Offscreen color target + depth buffer.
     vk::ImageSubresourceRange colorRange{};
@@ -138,11 +138,11 @@ int main() {
              .setUsage(vk::ImageUsageFlagBits::ColorAttachment | vk::ImageUsageFlagBits::TransferSrc)
              .setSharingMode(vk::SharingMode::Exclusive).setInitialLayout(vk::ImageLayout::Undefined);
     auto colorImage = device->createImage(colorInfo, std::nullopt);
-    auto colorReqs = device->getImageMemoryRequirements(*colorImage);
+    auto colorReqs = colorImage->getMemoryRequirements();
     auto colorMemory = device->allocateMemory(
         vk::MemoryAllocateInfo{}.setAllocationSize(colorReqs.size)
             .setMemoryTypeIndex(find_memory_type(physical, deviceFlags)), std::nullopt);
-    if (!colorImage || !colorMemory || !device->bindImageMemory(*colorImage, *colorMemory, 0)) {
+    if (!colorImage || !colorMemory || !colorImage->bindMemory(*colorMemory, 0)) {
         std::println(stderr, "color image failed"); return 1;
     }
     auto colorView = device->createImageView(
@@ -159,11 +159,11 @@ int main() {
              .setUsage(vk::ImageUsageFlagBits::DepthStencilAttachment)
              .setSharingMode(vk::SharingMode::Exclusive).setInitialLayout(vk::ImageLayout::Undefined);
     auto depthImage = device->createImage(depthInfo, std::nullopt);
-    auto depthReqs = device->getImageMemoryRequirements(*depthImage);
+    auto depthReqs = depthImage->getMemoryRequirements();
     auto depthMemory = device->allocateMemory(
         vk::MemoryAllocateInfo{}.setAllocationSize(depthReqs.size)
             .setMemoryTypeIndex(find_memory_type(physical, deviceFlags)), std::nullopt);
-    if (!depthImage || !depthMemory || !device->bindImageMemory(*depthImage, *depthMemory, 0)) {
+    if (!depthImage || !depthMemory || !depthImage->bindMemory(*depthMemory, 0)) {
         std::println(stderr, "depth image failed"); return 1;
     }
     auto depthView = device->createImageView(
@@ -287,11 +287,11 @@ int main() {
     const vk::DeviceSize readbackSize = static_cast<vk::DeviceSize>(kWidth) * kHeight * 4;
     auto readbackBuffer = device->createBuffer(
         vk::BufferCreateInfo{}.setSize(readbackSize).setUsage(vk::BufferUsageFlagBits::TransferDst), std::nullopt);
-    auto readbackReqs = device->getBufferMemoryRequirements(*readbackBuffer);
+    auto readbackReqs = readbackBuffer->getMemoryRequirements();
     auto readbackMemory = device->allocateMemory(
         vk::MemoryAllocateInfo{}.setAllocationSize(readbackReqs.size)
             .setMemoryTypeIndex(find_memory_type(physical, hostFlags)), std::nullopt);
-    if (!readbackBuffer || !readbackMemory || !device->bindBufferMemory(*readbackBuffer, *readbackMemory, 0)) {
+    if (!readbackBuffer || !readbackMemory || !readbackBuffer->bindMemory(*readbackMemory, 0)) {
         std::println(stderr, "readback buffer failed"); return 1;
     }
     auto copyCmd = commandBuffers.value()[0];
@@ -311,7 +311,7 @@ int main() {
     if (!queue.submit(std::array{copySubmit}, vk::Fence{}) || !device->waitIdle()) {
         std::println(stderr, "readback submit failed"); return 1;
     }
-    if (!device->mapMemory(*readbackMemory, 0, readbackSize, vk::MemoryMapFlags{}, &mapped)) {
+    if (!readbackMemory->mapMemory(0, readbackSize, vk::MemoryMapFlags{}, &mapped)) {
         std::println(stderr, "readback map failed"); return 1;
     }
     const auto* bytes = static_cast<const std::uint8_t*>(mapped);
@@ -321,7 +321,7 @@ int main() {
     };
     auto center = pixel(kWidth / 2, kHeight / 2);
     auto corner = pixel(100, 100);
-    device->unmapMemory(*readbackMemory);
+    readbackMemory->unmapMemory();
 
     bool centerBlue = center[0] < 60 && center[2] > 200;   // blue
     bool cornerRed = corner[0] > 200 && corner[2] < 60;    // red
