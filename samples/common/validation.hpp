@@ -6,9 +6,9 @@
 // (or the wrapper) misused the API, so reportValidation() treats errors as a
 // failure; warnings are printed but non-fatal.
 //
-// Include this AFTER your wrapper header (vulkan_wrapper.hpp or
-// vulkan_wrapper_vma.hpp); it relies on the vk:: types and the Vulkan
-// constants that header already pulls in through volk.
+// Include this AFTER your wrapper header (vulkan_wrapper.hpp); it relies on
+// the vk:: types and the Vulkan constants that header already pulls in through
+// volk.
 #pragma once
 
 #include <cstdio>

@@ -9,7 +9,6 @@ from .emitter import emit_sections
 from .ir import RegistryError, build_ir
 from .naming import strip_vk
 from .template import TemplateError, atomic_write, load_template, render_template
-from .vma import VmaError, parse_vma_header
 
 
 def _split_emit_spec(spec: str) -> tuple[Path, Path]:
@@ -36,8 +35,6 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--registry", action="append", type=Path, required=True,
                         help="Registry XML input; repeat for vk.xml, video.xml, and other registries")
-    parser.add_argument("--vma-header", type=Path, help="Optional vk_mem_alloc.h parsed with libclang")
-    parser.add_argument("--clang-arg", action="append", default=[], help="Argument forwarded to libclang")
     parser.add_argument("--config", type=Path, help="Versioned TOML generator configuration")
     parser.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
                         help="Override a config option (repeatable; list options are replaced)")
@@ -123,7 +120,6 @@ def run(arguments: list[str] | None = None) -> int:
     for command_name in config.command_names:
         if command_name not in known_commands and command_name not in ir.commands:
             raise ConfigError(f"naming.commands names unknown command {command_name}")
-    vma = parse_vma_header(args.vma_header, tuple(args.clang_arg), config.vma_functions) if args.vma_header else None
     known_types = set(ir.type_order) | set(config.type_names.values())
     rendered_outputs: list[tuple[Path, str]] = []
     # Validate every template before replacing any output. Individual file
@@ -131,7 +127,7 @@ def run(arguments: list[str] | None = None) -> int:
     # update an otherwise paired invocation.
     for template_path, output_path in pairs:
         template = load_template(template_path)
-        sections = emit_sections(ir, config, template, vma)
+        sections = emit_sections(ir, config, template)
         rendered_outputs.append((output_path, render_template(template, sections, known_types)))
     changed = False
     for output_path, generated in rendered_outputs:
@@ -150,7 +146,7 @@ def run(arguments: list[str] | None = None) -> int:
 def main() -> None:
     try:
         raise SystemExit(run())
-    except (ConfigError, RegistryError, TemplateError, VmaError) as exc:
+    except (ConfigError, RegistryError, TemplateError) as exc:
         print(f"vulkan-wrapper-gen: error: {exc}", file=sys.stderr)
         raise SystemExit(2) from exc
 

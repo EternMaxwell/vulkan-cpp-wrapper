@@ -21,21 +21,3 @@ exclude_types = []
 [naming.types]
 
 [naming.commands]
-
-[vma]
-include = "vk_mem_alloc.h"
-functions = [
-  "vmaCreateAllocator",
-  "vmaDestroyAllocator",
-  "vmaAllocateMemory",
-  "vmaFreeMemory",
-  "vmaMapMemory",
-  "vmaUnmapMemory",
-  "vmaFlushAllocation",
-  "vmaInvalidateAllocation",
-  "vmaGetAllocationInfo",
-  "vmaCreateBuffer",
-  "vmaDestroyBuffer",
-  "vmaCreateImage",
-  "vmaDestroyImage",
-]

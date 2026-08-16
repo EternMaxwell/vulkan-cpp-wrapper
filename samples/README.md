@@ -53,11 +53,12 @@ cmake --build samples/build-nosync
   chains built with either the nested setter
   (`a.setNextInChain(std::move(b.setNextInChain(c)))`) or the mutable node
   accessor, and feature enablement at device creation. No shaders.
-- `07-vma` — the VulkanMemoryAllocator integration: `Allocator::create`,
-  VMA-backed buffer/image creation (with creation records and allocation
-  metadata), and a raw allocation + `AllocationView::map`/`unmap` round-trip.
-  Uses a separate VMA-enabled wrapper (`vulkan_wrapper_vma.hpp`) so the other
-  samples carry no VMA dependency. No shaders.
+- `07-vma` — the VulkanMemoryAllocator convenience (template-provided, since
+  the generator stays Vulkan-only): `Device::allocator` (created on first use
+  and cached in the device's user data) plus `Device::createAllocatedBuffer`
+  and `Device::createAllocatedImage`. VMA is compiled in this sample's own TU
+  (`VMA_IMPLEMENTATION`) so the other samples carry no VMA link dependency. No
+  shaders.
 - `08-allocator` — custom `VkAllocationCallbacks` (the multi-callback,
   one-userdata case) provided as capturing lambdas; creates a buffer through a
   correct aligned allocator and asserts the driver actually invokes the

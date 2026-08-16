@@ -84,30 +84,12 @@ add_custom_command(
     VERBATIM)
 add_custom_target(generate_wrapper DEPENDS ${WRAPPER})
 
-# A second wrapper with VMA support, used only by the 07-vma sample so the
-# other samples do not carry an unconditional VMA dependency.
-set(WRAPPER_VMA ${CMAKE_BINARY_DIR}/generated/vulkan_wrapper_vma.hpp)
-add_custom_command(
-    OUTPUT ${WRAPPER_VMA}
-    COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/generated
-    COMMAND ${Python3_EXECUTABLE} -m vulkan_wrapper_gen
-        --registry ${vulkan_headers_SOURCE_DIR}/registry/vk.xml
-        --registry ${vulkan_headers_SOURCE_DIR}/registry/video.xml
-        --vma-header ${vma_SOURCE_DIR}/include/vk_mem_alloc.h
-        --clang-arg=-I${vulkan_headers_SOURCE_DIR}/include
-        ${WRAPPER_SYNC_FLAG}
-        --emit ${REPO_ROOT}/templates/vulkan-header-only.template.hpp:${WRAPPER_VMA}
-    WORKING_DIRECTORY ${REPO_ROOT}
-    DEPENDS ${WRAPPER_GEN_SOURCES}
-    COMMENT "Generating vulkan_wrapper_vma.hpp"
-    VERBATIM)
-add_custom_target(generate_wrapper_vma DEPENDS ${WRAPPER_VMA})
-
 function(wrapper_sample target)
     target_link_libraries(${target} PRIVATE volk::volk_headers volk::volk)
     target_include_directories(${target} PRIVATE
         ${CMAKE_BINARY_DIR}/generated
         ${vulkan_headers_SOURCE_DIR}/include
+        ${vma_SOURCE_DIR}/include
         ${CMAKE_CURRENT_LIST_DIR}/common)
     if (WIN32)
         target_compile_definitions(${target} PRIVATE VK_USE_PLATFORM_WIN32_KHR NOMINMAX)
@@ -226,12 +208,10 @@ add_executable(pnext 06-pnext/main.cpp)
 wrapper_sample(pnext)
 
 # ---------------------------------------------------------------------------
-# 07-vma: VMA allocator integration; no shaders, always builds.
+# 07-vma: VMA allocator convenience; no shaders, always builds.
 # ---------------------------------------------------------------------------
 add_executable(vma 07-vma/main.cpp)
 wrapper_sample(vma)
-target_include_directories(vma PRIVATE ${vma_SOURCE_DIR}/include)
-add_dependencies(vma generate_wrapper_vma)
 
 # ---------------------------------------------------------------------------
 # 08-allocator: custom allocation callbacks round-trip; no shaders, always builds.

@@ -1,17 +1,16 @@
-// 07-vma: verifies the wrapper's VulkanMemoryAllocator integration.
+// 07-vma: verifies the wrapper's VulkanMemoryAllocator convenience.
 //
-// Directionally exercises Allocator::create, VMA-backed buffer/image creation
-// (with their creation records and allocation metadata), and raw allocation +
-// AllocationView::map/unmap. VMA is compiled in this TU (VMA_IMPLEMENTATION)
-// and driven through volk's vkGetInstanceProcAddr / vkGetDeviceProcAddr.
+// The generator stays Vulkan-only; VMA integration lives entirely in the
+// wrapper template as three Device conveniences: allocator() (created on first
+// use and cached in the device's user data, so it is destroyed with the
+// device) plus createAllocatedBuffer/createAllocatedImage. VMA is compiled in
+// this TU (VMA_IMPLEMENTATION) and driven through volk's proc addresses, which
+// the template wires up for us.
 #define VMA_IMPLEMENTATION
-#define VMA_STATIC_VULKAN_FUNCTIONS 0
-#define VMA_DYNAMIC_VULKAN_FUNCTIONS 1
-#include <vulkan_wrapper_vma.hpp>
+#include <vulkan_wrapper.hpp>
 #include <validation.hpp>
 
 #include <cstdint>
-#include <cstring>
 #include <print>
 
 static std::uint32_t find_graphics_family(const vk::PhysicalDevice& physical) {
@@ -56,71 +55,38 @@ int main() {
     auto device = physical.createDevice(deviceInfo, std::nullopt);
     if (!device) { std::println(stderr, "createDevice failed"); return 1; }
 
-    // Wire VMA to volk's loader/device proc-address functions.
-    VmaVulkanFunctions vmaFunctions{};
-    vmaFunctions.vkGetInstanceProcAddr = vkGetInstanceProcAddr;
-    vmaFunctions.vkGetDeviceProcAddr = vkGetDeviceProcAddr;
-    VmaAllocatorCreateInfo allocatorInfo{};
-    allocatorInfo.physicalDevice = physical.raw();
-    allocatorInfo.device = device->raw();
-    allocatorInfo.instance = instance->raw();
-    allocatorInfo.pVulkanFunctions = &vmaFunctions;
-    allocatorInfo.vulkanApiVersion = VK_API_VERSION_1_3;
+    // The allocator is created on first use and cached in the device's user
+    // data (destroyed with the device).
+    VmaAllocator allocator = device->allocator();
+    bool allocatorOk = allocator != VmaAllocator{};
 
-    auto allocator = vk::Allocator::create(*device, allocatorInfo);
-    if (!allocator) { std::println(stderr, "Allocator::create failed"); return 1; }
-
-    // VMA-backed buffer (with creation record + allocation metadata).
+    // VMA-backed buffer (its creation record is retained).
     VmaAllocationCreateInfo bufferAllocInfo{};
     bufferAllocInfo.usage = VMA_MEMORY_USAGE_AUTO;
     bufferAllocInfo.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
-    auto vmaBuffer = allocator->createBuffer(
+    auto vmaBuffer = device->createAllocatedBuffer(
         vk::BufferCreateInfo{}.setSize(64).setUsage(vk::BufferUsageFlagBits::VertexBuffer),
         bufferAllocInfo);
     bool bufferOk = vmaBuffer && vmaBuffer->createInfo() &&
                     vmaBuffer->createInfo()->size == 64 &&
-                    vmaBuffer->allocation() != VmaAllocation{} &&
-                    vmaBuffer->allocationInfo() && vmaBuffer->allocationInfo()->size >= 64 &&
-                    vmaBuffer->allocationCreateInfo() &&
-                    vmaBuffer->allocationCreateInfo()->usage == VMA_MEMORY_USAGE_AUTO;
+                    vmaBuffer->raw() != VkBuffer{};
 
     // VMA-backed image.
     VmaAllocationCreateInfo imageAllocInfo{};
     imageAllocInfo.usage = VMA_MEMORY_USAGE_AUTO;
-    auto vmaImage = allocator->createImage(
+    auto vmaImage = device->createAllocatedImage(
         vk::ImageCreateInfo{}.setImageType(vk::ImageType::Value2d)
             .setFormat(vk::Format::R8g8b8a8Unorm).setExtent(vk::Extent3D{16, 16, 1})
             .setMipLevels(1).setArrayLayers(1).setSamples(vk::SampleCountFlagBits::Value1)
             .setTiling(vk::ImageTiling::Optimal)
             .setUsage(vk::ImageUsageFlagBits::Sampled),
         imageAllocInfo);
-    bool imageOk = vmaImage && vmaImage->allocation() != VmaAllocation{};
+    bool imageOk = vmaImage && vmaImage->raw() != VkImage{};
 
-    // Raw allocation + map/unmap round-trip.
-    vk::MemoryRequirements reqs{};
-    reqs.setSize(64).setAlignment(16).setMemoryTypeBits(0xFFFFFFFF);
-    VmaAllocationCreateInfo rawAllocInfo{};
-    rawAllocInfo.usage = VMA_MEMORY_USAGE_CPU_TO_GPU;  // host-visible, mappable
-    auto allocation = allocator->allocate(reqs, rawAllocInfo);
-    bool mapOk = false;
-    if (allocation) {
-        auto mapped = allocation->view().map();
-        if (mapped) {
-            std::memset(*mapped, 0xAB, 64);
-            auto verify = allocation->view().map();
-            if (verify) {
-                mapOk = std::memcmp(*mapped, *verify, 64) == 0;
-                const auto* bytes = static_cast<const std::uint8_t*>(*verify);
-                mapOk = mapOk && bytes[0] == 0xAB && bytes[63] == 0xAB;
-            }
-            allocation->view().unmap();
-        }
-    }
-
-    std::println("VMA: allocator={} buffer={} image={} map={}",
-                 allocator->use_count() > 0 ? "ok" : "missing",
-                 bufferOk ? "ok" : "missing", imageOk ? "ok" : "missing", mapOk ? "ok" : "failed");
-    if (!bufferOk || !imageOk || !mapOk) {
+    std::println("VMA: allocator={} buffer={} image={}",
+                 allocatorOk ? "ok" : "missing",
+                 bufferOk ? "ok" : "missing", imageOk ? "ok" : "missing");
+    if (!allocatorOk || !bufferOk || !imageOk) {
         std::println(stderr, "FAIL: VMA verification failed");
         return 1;
     }

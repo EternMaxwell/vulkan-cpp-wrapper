@@ -13,8 +13,7 @@ authors = [{ name = "vulkan-wrapper contributors" }]
 dependencies = []
 
 [project.optional-dependencies]
-vma = ["libclang>=18"]
-test = ["pytest>=8", "libclang>=18"]
+test = ["pytest>=8"]
 
 [project.scripts]
 vulkan-wrapper-gen = "vulkan_wrapper_gen.cli:main"

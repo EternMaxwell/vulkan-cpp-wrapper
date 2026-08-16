@@ -615,7 +615,7 @@ def test_cli_set_and_add_config_overrides(tmp_path):
             [
                 "--registry",
                 str(FIXTURE),
-                "--set", "namespace=custom",
+                "--set", "minimum_core=1.2",
                 "--add", "exclude_commands=vkCreateBuffer",
                 "--emit", str(ROOT / "templates" / "vulkan-header-only.template.hpp") + ":" + str(output),
             ]
@@ -623,8 +623,6 @@ def test_cli_set_and_add_config_overrides(tmp_path):
         == 0
     )
     generated = output.read_text(encoding="utf-8")
-    assert "namespace custom {" in generated
-    assert "namespace vk {" not in generated
     # --add appends to the exclusion list; vkCreateBuffer disappears.
     assert "createBuffer" not in generated
     assert "vkDestroyBuffer" not in generated

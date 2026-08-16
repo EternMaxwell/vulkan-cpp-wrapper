@@ -1,6 +1,6 @@
 # Vulkan C++ Wrapper Generator
 
-`vulkan-wrapper-gen` is a Python 3.12+ generator for configurable C++23 Vulkan wrappers. It reads the Khronos XML registry directly, retains core/extension/alias/platform metadata, and can optionally inspect `vk_mem_alloc.h` with libclang.
+`vulkan-wrapper-gen` is a Python 3.12+ generator for configurable C++23 Vulkan wrappers. It reads the Khronos XML registry directly and retains core/extension/alias/platform metadata.
 
 The repository contains generator and template sources only. Generated wrappers belong in your build directory and are intentionally ignored by source control.
 
@@ -8,7 +8,6 @@ The repository contains generator and template sources only. Generated wrappers 
 
 ```console
 python -m pip install -e .
-python -m pip install -e ".[vma]"  # only when parsing vk_mem_alloc.h
 ```
 
 ## Generate
@@ -24,7 +23,7 @@ vulkan-wrapper-gen \
   --emit templates/vulkan.template.cpp:build/generated/vulkan_wrapper.cpp
 ```
 
-Header-only and module presets are available as `templates/vulkan-header-only.template.hpp` and `templates/vulkan.template.cppm`. Add `--vma-header /path/to/vk_mem_alloc.h` and repeat `--clang-arg` for include directories, platform defines, or target flags.
+Header-only and module presets are available as `templates/vulkan-header-only.template.hpp` and `templates/vulkan.template.cppm` (plus the paired `templates/vulkan.template.hpp`/`templates/vulkan.template.cpp`). Every preset carries the VulkanMemoryAllocator convenience (see the templates section); add the VulkanMemoryAllocator include directory to any translation unit that includes a wrapper generated from them.
 
 `--check` renders in memory and exits with status 1 if existing outputs differ.
 
@@ -40,6 +39,8 @@ typename SwapchainKHR:
 ```
 
 The injection target must be a generated C++ type. Declarations and definitions are separate template payloads. `{{structs}}` and `{{handles}}` contain public declarations (with `Context` included in the latter); `{{struct_implementations}}` and `{{handle_implementations}}` contain ordinary definitions. The independently placeable `{{struct_template_implementations}}`, `{{handle_template_implementations}}`, and `{{command_template_implementations}}` sections contain definitions that must remain visible at template instantiation. Struct setters and simple getters intentionally remain inline in their declarations. The complete marker set is visible in the maintained templates.
+
+Every preset demonstrates a cross-type convenience: `Device::allocator`, `Device::createAllocatedBuffer`, and `Device::createAllocatedImage` are declared via a `typename Device:` injection (their parameter/return types are forward-declared). In the header-only and module presets the definitions are inline text placed after the `{{namespace}}` block (or in the module implementation section) so every Vulkan type is complete; in the split preset the declarations land in `{{handles}}` and the non-inline definitions in the paired `.cpp`. VMA types come from `#include <vk_mem_alloc.h>`, which each template emits with `VMA_DYNAMIC_VULKAN_FUNCTIONS` wired to volk; compile VMA itself with `#define VMA_IMPLEMENTATION` in exactly one translation unit.
 
 ## Configuration
 

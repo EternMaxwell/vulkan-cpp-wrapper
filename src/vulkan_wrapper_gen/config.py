@@ -32,13 +32,6 @@ class GeneratorConfig:
     receivers: dict[str, ReceiverOverride] = field(default_factory=dict)
     type_names: dict[str, str] = field(default_factory=dict)
     command_names: dict[str, str] = field(default_factory=dict)
-    vma_include: str = "vk_mem_alloc.h"
-    vma_functions: tuple[str, ...] = (
-        "vmaCreateAllocator", "vmaDestroyAllocator", "vmaAllocateMemory",
-        "vmaFreeMemory", "vmaMapMemory", "vmaUnmapMemory",
-        "vmaFlushAllocation", "vmaInvalidateAllocation", "vmaGetAllocationInfo",
-        "vmaCreateBuffer", "vmaDestroyBuffer", "vmaCreateImage", "vmaDestroyImage",
-    )
 
 
 def _strings(value: object, key: str) -> tuple[str, ...]:
@@ -49,10 +42,10 @@ def _strings(value: object, key: str) -> tuple[str, ...]:
     return tuple(value)
 
 
-_STR_FIELDS = frozenset({"namespace", "module", "api", "minimum_core", "vma_include"})
+_STR_FIELDS = frozenset({"namespace", "module", "api", "minimum_core"})
 _BOOL_FIELDS = frozenset({"emit_docs", "externsync"})
 _LIST_FIELDS = frozenset(
-    {"include_extensions", "exclude_extensions", "exclude_commands", "exclude_types", "vma_functions"}
+    {"include_extensions", "exclude_extensions", "exclude_commands", "exclude_types"}
 )
 
 
@@ -114,9 +107,8 @@ def load_config(path: Path | None = None) -> GeneratorConfig:
     project = data.get("generator", {})
     filters = data.get("filters", {})
     naming = data.get("naming", {})
-    vma = data.get("vma", {})
-    if not all(isinstance(x, dict) for x in (project, filters, naming, vma)):
-        raise ConfigError("generator, filters, naming, and vma must be TOML tables")
+    if not all(isinstance(x, dict) for x in (project, filters, naming)):
+        raise ConfigError("generator, filters, and naming must be TOML tables")
     overrides: dict[str, ReceiverOverride] = {}
     receiver_data = data.get("receivers", {})
     if not isinstance(receiver_data, dict):
@@ -147,6 +139,4 @@ def load_config(path: Path | None = None) -> GeneratorConfig:
         receivers=overrides,
         type_names={str(k): str(v) for k, v in type_names.items()},
         command_names={str(k): str(v) for k, v in command_names.items()},
-        vma_include=str(vma.get("include", "vk_mem_alloc.h")),
-        vma_functions=_strings(vma.get("functions", list(GeneratorConfig().vma_functions)), "vma.functions"),
     )

@@ -24,7 +24,6 @@ from .ir.model import (
 )
 from .naming import constant_name, enum_name
 from .template import Template
-from .vma import VmaModel
 
 
 # ---------------------------------------------------------------------------
@@ -3621,7 +3620,6 @@ def _emit_handle(
     ir: IrRegistry,
     config: GeneratorConfig,
     injection: list[str],
-    vma_resources: frozenset[str],
 ) -> str:
     name = _cpp_type(handle.name, ir, config)
     parent = _cpp_type(handle.parent, ir, config) if handle.parent else None
@@ -3667,17 +3665,6 @@ def _emit_handle(
     if handle.create_info:
         state_lines.append(
             f"    std::shared_ptr<const {_cpp_type(handle.create_info, ir, config)}> create_info;"
-        )
-    vma_resource = handle.c_name in vma_resources
-    if vma_resource:
-        state_lines.extend(
-            [
-                "    std::shared_ptr<void> vma_allocator_lifetime;",
-                "    VmaAllocator vma_allocator{};",
-                "    VmaAllocation vma_allocation{};",
-                "    VmaAllocationInfo vma_allocation_info{};",
-                "    VmaAllocationCreateInfo vma_allocation_create_info{};",
-            ]
         )
     state_lines.extend(
         [
@@ -3799,16 +3786,6 @@ def _emit_handle(
         lines.append(
             f"    [[nodiscard]] const {cpp_info}* createInfo() const noexcept {{ return ctrl_ ? ctrl_->create_info.get() : nullptr; }}"
         )
-    if vma_resource:
-        lines.append(
-            "    [[nodiscard]] VmaAllocation allocation() const noexcept { return ctrl_ ? ctrl_->vma_allocation : VmaAllocation{}; }"
-        )
-        lines.append(
-            "    [[nodiscard]] const VmaAllocationInfo* allocationInfo() const noexcept { return ctrl_ && ctrl_->vma_allocation != VmaAllocation{} ? &ctrl_->vma_allocation_info : nullptr; }"
-        )
-        lines.append(
-            "    [[nodiscard]] const VmaAllocationCreateInfo* allocationCreateInfo() const noexcept { return ctrl_ && ctrl_->vma_allocation != VmaAllocation{} ? &ctrl_->vma_allocation_create_info : nullptr; }"
-        )
     lines.extend(
         [
             "    template <typename T> [[nodiscard]] Result<void> setUserData(std::shared_ptr<const T> value) const;",
@@ -3827,15 +3804,6 @@ def _emit_handle(
     lines.append(
         f"    [[nodiscard]] static Result<{name}> adopt(native_type native{adoption}, std::function<void(native_type)> destroyer{create_info_arg});"
     )
-    if vma_resource and parent:
-        create_record = (
-            f", std::shared_ptr<const {_cpp_type(handle.create_info, ir, config)}> creationRecord"
-            if handle.create_info
-            else ""
-        )
-        lines.append(
-            f"    [[nodiscard]] static Result<{name}> adoptVma(native_type native, const {parent}& parent, std::shared_ptr<void> allocatorLifetime, VmaAllocator allocator, VmaAllocation allocation, const VmaAllocationInfo& allocationInfo, const VmaAllocationCreateInfo& allocationCreateInfo{create_record});"
-        )
     seen: set[tuple[str, str]] = set()
     for command in _handle_commands(handle, ir):
         declaration = _method_decl(command, handle.name, ir, config)
@@ -3894,7 +3862,6 @@ def _emit_handles(
     ir: IrRegistry,
     config: GeneratorConfig,
     template: Template,
-    vma_resources: frozenset[str],
 ) -> str:
     active = [handle for handle in ir.handles.values() if handle.active]
     pending = list(active)
@@ -3918,7 +3885,6 @@ def _emit_handles(
             ir,
             config,
             template.injections.get(_cpp_type(handle.name, ir, config), []),
-            vma_resources,
         )
         for handle in ordered
     )
@@ -3929,14 +3895,12 @@ def _emit_handle_lifetime_impl(
     handle: Handle,
     ir: IrRegistry,
     config: GeneratorConfig,
-    vma_resources: frozenset[str],
 ) -> str:
     name = _cpp_type(handle.name, ir, config)
     state_name = f"{name}ControlBlock"
     parent = _cpp_type(handle.parent, ir, config) if handle.parent else None
     object_type = handle.object_type_enum or "VK_OBJECT_TYPE_UNKNOWN"
     device_scope = _is_device_scope(handle, ir)
-    vma_resource = handle.c_name in vma_resources
     uses_host_registry = not device_scope or handle.c_name == "VkDevice"
     lines = [
         f"inline void detail::{state_name}::detach(detail::{state_name}* self) noexcept {{"
@@ -3996,28 +3960,18 @@ def _emit_handle_lifetime_impl(
                 "        }",
             ]
         )
-    if vma_resource:
-        function = "vmaDestroyBuffer" if handle.c_name == "VkBuffer" else "vmaDestroyImage"
-        destroy_call = (
-            "self->destroyer(self->parent, self->native)"
-            if parent
-            else "self->destroyer(self->native)"
-        )
-        lines.extend(
-            [
-                f"        if (self->vma_allocation != VmaAllocation{{}}) {{ {function}(self->vma_allocator, self->native, self->vma_allocation); self->vma_allocation = {{}}; }}",
-                f"        else if (self->destroyer && self->native != native_type{{}}) {destroy_call};",
-            ]
-        )
-    else:
-        destroy_call = (
-            "self->destroyer(self->parent, self->native)"
-            if parent
-            else "self->destroyer(self->native)"
-        )
-        lines.append(
-            f"        if (self->destroyer && self->native != native_type{{}}) {destroy_call};"
-        )
+    # User data is destroyed before the native handle so that resources stored
+    # through setUserData (for example a VMA allocator cached on a Device) are
+    # released while the native handle is still valid.
+    lines.append("        self->data.reset();")
+    destroy_call = (
+        "self->destroyer(self->parent, self->native)"
+        if parent
+        else "self->destroyer(self->native)"
+    )
+    lines.append(
+        f"        if (self->destroyer && self->native != native_type{{}}) {destroy_call};"
+    )
     lines.extend(
         [
             f'    }} catch (...) {{ detail::report_error(ResultCode::ErrorUnknown, "{name}", detail::raw_key(self->native)); }}',
@@ -4210,35 +4164,19 @@ def _emit_handle_lifetime_impl(
     )
     adopt_lines.append("}")
     lines.append("\n".join(adopt_lines))
-    if vma_resource and parent:
-        vma_destroy = "vmaDestroyBuffer" if handle.c_name == "VkBuffer" else "vmaDestroyImage"
-        create_record_arg = (
-            f", std::shared_ptr<const {_cpp_type(handle.create_info, ir, config)}> creationRecord"
-            if handle.create_info
-            else ""
-        )
-        create_record_store = (
-            " state->create_info = std::move(creationRecord);"
-            if handle.create_info
-            else ""
-        )
-        lines.append(
-            f"inline Result<{name}> {name}::adoptVma(native_type native, const {parent}& parent, std::shared_ptr<void> allocatorLifetime, VmaAllocator allocator, VmaAllocation allocation, const VmaAllocationInfo& allocationInfo, const VmaAllocationCreateInfo& allocationCreateInfo{create_record_arg}) {{ if (!allocator || !allocation || native == native_type{{}}) return std::unexpected(ResultCode::ErrorUnknown); auto association = parent.deviceAssociation(); if (!association) {{ {vma_destroy}(allocator, native, allocation); return std::unexpected(ResultCode::ErrorUnknown); }} std::unique_lock lock(detail::{state_name}::tracking_mutex); std::unique_lock association_lock(*association.mutex); std::uint64_t existing{{}}; association.dispatch->vkGetPrivateData(association.device, {object_type}, detail::raw_key(native), association.slot, &existing); detail::{state_name}* state = existing ? static_cast<detail::{state_name}*>(reinterpret_cast<detail::LifetimeHeader*>(static_cast<std::uintptr_t>(existing))) : nullptr; if (state) {{ state->retain(); return {name}(state); }} state = new (std::nothrow) detail::{state_name}; if (!state) {{ association_lock.unlock(); lock.unlock(); {vma_destroy}(allocator, native, allocation); return std::unexpected(ResultCode::ErrorOutOfHostMemory); }} state->native = native; state->parent = parent; state->vma_allocator_lifetime = std::move(allocatorLifetime); state->vma_allocator = allocator; state->vma_allocation = allocation; state->vma_allocation_info = allocationInfo; state->vma_allocation_create_info = allocationCreateInfo;{create_record_store} auto status = association.dispatch->vkSetPrivateData(association.device, {object_type}, detail::raw_key(native), association.slot, static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(static_cast<detail::LifetimeHeader*>(state)))); if (status != VK_SUCCESS) {{ association_lock.unlock(); delete state; lock.unlock(); {vma_destroy}(allocator, native, allocation); return std::unexpected(static_cast<ResultCode>(status)); }} return {name}(state); }}"
-        )
     return _guard("\n".join(lines), handle.protect or handle.availability.protect)
 
 
 def _emit_handle_implementations(
     ir: IrRegistry,
     config: GeneratorConfig,
-    vma_resources: frozenset[str],
 ) -> str:
     result: list[str] = []
     for handle in ir.handles.values():
         if not handle.active:
             continue
         result.append(
-            _emit_handle_lifetime_impl(handle, ir, config, vma_resources)
+            _emit_handle_lifetime_impl(handle, ir, config)
         )
         seen: set[str] = set()
         for command in _handle_commands(handle, ir):
@@ -4665,178 +4603,6 @@ class ExtensionChain {
 };"""
 
 
-# ---------------------------------------------------------------------------
-# VMA (unchanged, operates on VmaModel)
-# ---------------------------------------------------------------------------
-
-def _vma_sections(vma: VmaModel | None) -> tuple[str, str]:
-    if not vma:
-        return "", ""
-    functions = set(vma.functions)
-    allocator_ownership = {"vmaCreateAllocator", "vmaDestroyAllocator"} <= functions
-    allocation_ownership = {"vmaAllocateMemory", "vmaFreeMemory"} <= functions
-    buffer_ownership = {"vmaCreateBuffer", "vmaDestroyBuffer"} <= functions
-    image_ownership = {"vmaCreateImage", "vmaDestroyImage"} <= functions
-    declarations: list[str] = []
-    implementations: list[str] = []
-
-    view = [
-        r"""class AllocationView {
-    VmaAllocator allocator_{};
-    VmaAllocation allocation_{};
-  public:
-    AllocationView() noexcept = default;
-    AllocationView(VmaAllocator allocator, VmaAllocation allocation) noexcept : allocator_(allocator), allocation_(allocation) {}
-    [[nodiscard]] VmaAllocation raw() const noexcept { return allocation_; }
-    [[nodiscard]] explicit operator bool() const noexcept { return allocation_ != VmaAllocation{}; }"""
-    ]
-    if "vmaGetAllocationInfo" in functions:
-        view.append("    [[nodiscard]] VmaAllocationInfo information() const noexcept;")
-        implementations.append(
-            "inline VmaAllocationInfo AllocationView::information() const noexcept { VmaAllocationInfo value{}; if (allocation_) vmaGetAllocationInfo(allocator_, allocation_, &value); return value; }"
-        )
-    if "vmaMapMemory" in functions:
-        view.append("    [[nodiscard]] Result<void*> map() const;")
-        implementations.append(
-            "inline Result<void*> AllocationView::map() const { void* value{}; auto result = vmaMapMemory(allocator_, allocation_, &value); if (result != VK_SUCCESS) return std::unexpected(static_cast<ResultCode>(result)); return value; }"
-        )
-    if "vmaUnmapMemory" in functions:
-        view.append("    void unmap() const noexcept;")
-        implementations.append(
-            "inline void AllocationView::unmap() const noexcept { if (allocation_) vmaUnmapMemory(allocator_, allocation_); }"
-        )
-    if "vmaFlushAllocation" in functions:
-        view.append(
-            "    [[nodiscard]] Result<void> flush(DeviceSize offset = 0, DeviceSize size = VK_WHOLE_SIZE) const;"
-        )
-        implementations.append(
-            "inline Result<void> AllocationView::flush(DeviceSize offset, DeviceSize size) const { auto result = vmaFlushAllocation(allocator_, allocation_, offset, size); if (result != VK_SUCCESS) return std::unexpected(static_cast<ResultCode>(result)); return {}; }"
-        )
-    if "vmaInvalidateAllocation" in functions:
-        view.append(
-            "    [[nodiscard]] Result<void> invalidate(DeviceSize offset = 0, DeviceSize size = VK_WHOLE_SIZE) const;"
-        )
-        implementations.append(
-            "inline Result<void> AllocationView::invalidate(DeviceSize offset, DeviceSize size) const { auto result = vmaInvalidateAllocation(allocator_, allocation_, offset, size); if (result != VK_SUCCESS) return std::unexpected(static_cast<ResultCode>(result)); return {}; }"
-        )
-    view.append("};")
-    declarations.append("\n".join(view))
-
-    if allocation_ownership:
-        declarations.append(r"""class Allocation {
-    struct State {
-        std::shared_ptr<void> allocator_lifetime;
-        VmaAllocator allocator{};
-        VmaAllocation allocation{};
-        State(std::shared_ptr<void> lifetime, VmaAllocator a, VmaAllocation v) : allocator_lifetime(std::move(lifetime)), allocator(a), allocation(v) {}
-        ~State();
-    };
-    std::shared_ptr<State> state_;
-    explicit Allocation(std::shared_ptr<State> state) : state_(std::move(state)) {}
-    friend class Allocator;
-  public:
-    Allocation() noexcept = default;
-    [[nodiscard]] VmaAllocation raw() const noexcept { return state_ ? state_->allocation : VmaAllocation{}; }
-    [[nodiscard]] AllocationView view() const noexcept { return state_ ? AllocationView(state_->allocator, state_->allocation) : AllocationView{}; }
-    [[nodiscard]] long use_count() const noexcept { return state_.use_count(); }
-    void reset() noexcept { state_.reset(); }
-};""")
-        implementations.append(
-            "inline Allocation::State::~State() { if (allocation) vmaFreeMemory(allocator, allocation); }"
-        )
-
-    allocator = ["class Allocator {"]
-    if allocator_ownership:
-        allocator.append(r"""    struct State {
-        VmaAllocator allocator{};
-        Device device{};
-        State(VmaAllocator a, Device d) : allocator(a), device(std::move(d)) {}
-        ~State();
-    };
-    std::shared_ptr<State> state_;""")
-    allocator.extend([r"""    VmaAllocator borrowed_{};
-    Device borrowed_device_{};"""])
-    if allocator_ownership:
-        allocator.append(
-            "    explicit Allocator(std::shared_ptr<State> state) : state_(std::move(state)) {}"
-        )
-    allocator.extend(
-        [
-            r"""    Allocator(VmaAllocator allocator, const Device& device) : borrowed_(allocator), borrowed_device_(device) {}
-  public:
-    Allocator() noexcept = default;"""
-        ]
-    )
-    if allocator_ownership:
-        implementations.append(
-            "inline Allocator::State::~State() { if (allocator) vmaDestroyAllocator(allocator); }"
-        )
-        allocator.extend(
-            [
-                "    [[nodiscard]] VmaAllocator raw() const noexcept { return state_ ? state_->allocator : borrowed_; }",
-                "    [[nodiscard]] Device device() const noexcept { return state_ ? state_->device : borrowed_device_; }",
-                "    [[nodiscard]] long use_count() const noexcept { return state_.use_count(); }",
-                "    void reset() noexcept { state_.reset(); borrowed_ = {}; borrowed_device_.reset(); }",
-                "    [[nodiscard]] std::shared_ptr<void> lifetime() const noexcept { return state_; }",
-                "    [[nodiscard]] static Result<Allocator> create(const Device& device, VmaAllocatorCreateInfo createInfo);",
-            ]
-        )
-        implementations.append(
-            "inline Result<Allocator> Allocator::create(const Device& device, VmaAllocatorCreateInfo createInfo) { createInfo.device = device.raw(); VmaAllocator value{}; auto result = vmaCreateAllocator(&createInfo, &value); if (result != VK_SUCCESS) return std::unexpected(static_cast<ResultCode>(result)); try { return Allocator(std::make_shared<State>(value, device)); } catch (...) { vmaDestroyAllocator(value); return std::unexpected(ResultCode::ErrorOutOfHostMemory); } }"
-        )
-    else:
-        allocator.extend(
-            [
-                "    [[nodiscard]] VmaAllocator raw() const noexcept { return borrowed_; }",
-                "    [[nodiscard]] const Device& device() const noexcept { return borrowed_device_; }",
-                "    [[nodiscard]] long use_count() const noexcept { return 0; }",
-                "    void reset() noexcept { borrowed_ = {}; borrowed_device_.reset(); }",
-                "    [[nodiscard]] std::shared_ptr<void> lifetime() const noexcept { return {}; }",
-            ]
-        )
-    allocator.append(
-        "    [[nodiscard]] static Allocator borrow(VmaAllocator allocator, const Device& device) { return Allocator(allocator, device); }"
-    )
-    if allocation_ownership:
-        allocator.append(
-            "    [[nodiscard]] Result<Allocation> allocate(const MemoryRequirements& requirements, const VmaAllocationCreateInfo& createInfo) const;"
-        )
-        implementations.append(
-            "inline Result<Allocation> Allocator::allocate(const MemoryRequirements& requirements, const VmaAllocationCreateInfo& createInfo) const { MemoryRequirements::CStruct requirementsNative{}; requirements.to_cstruct(&requirementsNative); VmaAllocation value{}; auto result = vmaAllocateMemory(raw(), &requirementsNative.value, &createInfo, &value, nullptr); if (result != VK_SUCCESS) return std::unexpected(static_cast<ResultCode>(result)); try { return Allocation(std::make_shared<Allocation::State>(lifetime(), raw(), value)); } catch (...) { vmaFreeMemory(raw(), value); return std::unexpected(ResultCode::ErrorOutOfHostMemory); } }"
-        )
-    if buffer_ownership:
-        allocator.append(
-            "    [[nodiscard]] Result<Buffer> createBuffer(const BufferCreateInfo& bufferInfo, const VmaAllocationCreateInfo& allocationInfo) const;"
-        )
-        implementations.append(
-            "inline Result<Buffer> Allocator::createBuffer(const BufferCreateInfo& bufferInfo, const VmaAllocationCreateInfo& allocationInfo) const { BufferCreateInfo::CStruct bufferNative{}; bufferInfo.to_cstruct(&bufferNative); VkBuffer buffer{}; VmaAllocation allocation{}; VmaAllocationInfo info{}; auto result = vmaCreateBuffer(raw(), &bufferNative.value, &allocationInfo, &buffer, &allocation, &info); if (result != VK_SUCCESS) return std::unexpected(static_cast<ResultCode>(result)); try { return Buffer::adoptVma(buffer, device(), lifetime(), raw(), allocation, info, allocationInfo, std::make_shared<const BufferCreateInfo>(bufferInfo)); } catch (...) { vmaDestroyBuffer(raw(), buffer, allocation); return std::unexpected(ResultCode::ErrorOutOfHostMemory); } }"
-        )
-    if image_ownership:
-        allocator.append(
-            "    [[nodiscard]] Result<Image> createImage(const ImageCreateInfo& imageInfo, const VmaAllocationCreateInfo& allocationInfo) const;"
-        )
-        implementations.append(
-            "inline Result<Image> Allocator::createImage(const ImageCreateInfo& imageInfo, const VmaAllocationCreateInfo& allocationInfo) const { ImageCreateInfo::CStruct imageNative{}; imageInfo.to_cstruct(&imageNative); VkImage image{}; VmaAllocation allocation{}; VmaAllocationInfo info{}; auto result = vmaCreateImage(raw(), &imageNative.value, &allocationInfo, &image, &allocation, &info); if (result != VK_SUCCESS) return std::unexpected(static_cast<ResultCode>(result)); try { return Image::adoptVma(image, device(), lifetime(), raw(), allocation, info, allocationInfo, std::make_shared<const ImageCreateInfo>(imageInfo)); } catch (...) { vmaDestroyImage(raw(), image, allocation); return std::unexpected(ResultCode::ErrorOutOfHostMemory); } }"
-        )
-    allocator.append("};")
-    declarations.append("\n".join(allocator))
-    metadata = [
-        f"// parsed VMA function: {fn.return_type} {fn.name}({', '.join(p.type for p in fn.parameters)})"
-        for fn in vma.functions.values()
-    ]
-    return "\n".join(declarations), "\n\n".join([*implementations, *metadata])
-
-
-def _vma_resource_types(vma: VmaModel | None) -> frozenset[str]:
-    if not vma:
-        return frozenset()
-    functions = set(vma.functions)
-    resources: set[str] = set()
-    if {"vmaCreateBuffer", "vmaDestroyBuffer"} <= functions:
-        resources.add("VkBuffer")
-    if {"vmaCreateImage", "vmaDestroyImage"} <= functions:
-        resources.add("VkImage")
-    return frozenset(resources)
 
 
 # ---------------------------------------------------------------------------
@@ -4847,7 +4613,6 @@ def emit_sections(
     ir: IrRegistry,
     config: GeneratorConfig,
     template: Template,
-    vma: VmaModel | None = None,
 ) -> dict[str, str]:
     known = {_cpp_type(name, ir, config) for name in ir.type_order}
     unknown_injections = set(template.injections) - known
@@ -4857,23 +4622,19 @@ def emit_sections(
         raise TemplateError(
             f"injections target unknown types: {', '.join(sorted(unknown_injections))}"
         )
-    vma_decl, vma_impl = _vma_sections(vma)
-    vma_resources = _vma_resource_types(vma)
     struct_impl = _emit_struct_implementations(ir, config)
-    handle_impl = _emit_handle_implementations(ir, config, vma_resources)
+    handle_impl = _emit_handle_implementations(ir, config)
     combined_output = (
         "{{handles}}" in template.text and "{{handle_implementations}}" in template.text
     )
     if not combined_output:
         struct_impl = re.sub(r"(?m)^inline ", "", struct_impl)
         handle_impl = re.sub(r"(?m)^inline ", "", handle_impl)
-        vma_impl = re.sub(r"(?m)^inline ", "", vma_impl)
     return {
         "generated_notice": "// Generated by vulkan-wrapper-gen. Do not edit.\n",
         "namespace": config.namespace,
         "module_name": config.module,
         "includes": "#ifndef NOMINMAX\n#define NOMINMAX\n#endif\n#include <volk.h>\n"
-        + (f"#include <{config.vma_include}>\n" if vma else "")
         + "#include <algorithm>\n#include <array>\n#include <atomic>\n#include <cstdint>\n#include <cstring>\n#include <expected>\n#include <functional>\n#include <limits>\n#include <memory>\n#include <mutex>\n#include <new>\n#include <optional>\n#include <ranges>\n#include <shared_mutex>\n#include <span>\n#include <string>\n#include <string_view>\n#include <typeindex>\n#include <type_traits>\n#include <unordered_map>\n#include <utility>\n#include <variant>\n#include <vector>",
         "forward_declarations": _emit_forwards(ir, config)
         + "\n"
@@ -4886,7 +4647,7 @@ def emit_sections(
         "runtime_implementations": "",
         "structure_extensions": _emit_extensions(ir, config),
         "structs": _emit_structs(ir, config, template),
-        "handles": _emit_handles(ir, config, template, vma_resources),
+        "handles": _emit_handles(ir, config, template),
         "context": "",
         "command_declarations": _emit_command_metadata(ir, config),
         "command_implementations": "",
@@ -4895,6 +4656,4 @@ def emit_sections(
         "handle_implementations": handle_impl,
         "handle_template_implementations": _emit_handle_template_implementations(ir, config),
         "command_template_implementations": "",
-        "vma_declarations": vma_decl,
-        "vma_implementations": vma_impl,
     }

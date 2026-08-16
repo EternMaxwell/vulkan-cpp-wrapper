@@ -42,9 +42,6 @@ def test_generated_handle_lifetimes_execute_against_fake_volk(tmp_path: Path):
             [
                 "--registry",
                 str(headers / "registry" / "vk.xml"),
-                "--vma-header",
-                str(vma / "include" / "vk_mem_alloc.h"),
-                "--clang-arg=-I" + str(headers / "include"),
                 "--emit", str(ROOT / "templates" / "vulkan-header-only.template.hpp") + ":" + str(generated),
             ]
         )
@@ -106,15 +103,6 @@ static int destruction_errors = 0;
 static vk::ResultCode destruction_error_code{};
 static std::string_view destruction_error_type{};
 static std::uint64_t destruction_error_identity = 0;
-static int vma_allocator_destroys = 0;
-static int vma_allocation_frees = 0;
-static int vma_buffer_destroys = 0;
-static int vma_image_destroys = 0;
-static int vma_maps = 0;
-static int vma_unmaps = 0;
-static int vma_flushes = 0;
-static int vma_invalidates = 0;
-static std::byte mapped_bytes[32]{};
 
 static void capture_destruction_error(
     vk::ResultCode code, std::string_view type, std::uint64_t identity) noexcept {
@@ -274,50 +262,6 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL fake_get_instance_proc(VkInstance, cons
     if (std::strcmp(name, "vkSetDebugUtilsObjectNameEXT") == 0) return reinterpret_cast<PFN_vkVoidFunction>(fake_set_debug_object_name);
     return nullptr;
 }
-
-VkResult vmaCreateAllocator(const VmaAllocatorCreateInfo*, VmaAllocator* allocator) {
-    *allocator = fake_handle<VmaAllocator>(0xa000);
-    return VK_SUCCESS;
-}
-void vmaDestroyAllocator(VmaAllocator) { ++vma_allocator_destroys; }
-VkResult vmaAllocateMemory(VmaAllocator, const VkMemoryRequirements*, const VmaAllocationCreateInfo*, VmaAllocation* allocation, VmaAllocationInfo* info) {
-    *allocation = fake_handle<VmaAllocation>(0xa100);
-    if (info) { *info = {}; info->size = 32; }
-    return VK_SUCCESS;
-}
-void vmaFreeMemory(VmaAllocator, VmaAllocation) { ++vma_allocation_frees; }
-VkResult vmaMapMemory(VmaAllocator, VmaAllocation, void** data) {
-    ++vma_maps;
-    *data = mapped_bytes;
-    return VK_SUCCESS;
-}
-void vmaUnmapMemory(VmaAllocator, VmaAllocation) { ++vma_unmaps; }
-VkResult vmaFlushAllocation(VmaAllocator, VmaAllocation, VkDeviceSize, VkDeviceSize) {
-    ++vma_flushes;
-    return VK_SUCCESS;
-}
-VkResult vmaInvalidateAllocation(VmaAllocator, VmaAllocation, VkDeviceSize, VkDeviceSize) {
-    ++vma_invalidates;
-    return VK_SUCCESS;
-}
-void vmaGetAllocationInfo(VmaAllocator, VmaAllocation, VmaAllocationInfo* info) {
-    *info = {};
-    info->size = 32;
-}
-VkResult vmaCreateBuffer(VmaAllocator, const VkBufferCreateInfo*, const VmaAllocationCreateInfo*, VkBuffer* buffer, VmaAllocation* allocation, VmaAllocationInfo* info) {
-    *buffer = fake_handle<VkBuffer>(0xa200);
-    *allocation = fake_handle<VmaAllocation>(0xa201);
-    if (info) { *info = {}; info->size = 64; }
-    return VK_SUCCESS;
-}
-void vmaDestroyBuffer(VmaAllocator, VkBuffer, VmaAllocation) { ++vma_buffer_destroys; }
-VkResult vmaCreateImage(VmaAllocator, const VkImageCreateInfo*, const VmaAllocationCreateInfo*, VkImage* image, VmaAllocation* allocation, VmaAllocationInfo* info) {
-    *image = fake_handle<VkImage>(0xa300);
-    *allocation = fake_handle<VmaAllocation>(0xa301);
-    if (info) { *info = {}; info->size = 128; }
-    return VK_SUCCESS;
-}
-void vmaDestroyImage(VmaAllocator, VkImage, VmaAllocation) { ++vma_image_destroys; }
 
 int main() {
     volkInitializeCustom(fake_get_instance_proc);
@@ -728,41 +672,6 @@ int main() {
         [&](VkBuffer) noexcept { ++race_buffer_destroys; }, {});
     assert(race_buffer);
 
-    // Standalone allocations and VMA resources retain their allocator. Their
-    // metadata remains separate from the concrete Vulkan createInfo getter,
-    // and each path chooses exactly one matching VMA destructor.
-    VmaAllocatorCreateInfo allocator_info{};
-    auto allocator = vk::Allocator::create(*race_device, allocator_info);
-    assert(allocator && allocator->use_count() == 1);
-    auto allocation = allocator->allocate(
-        vk::MemoryRequirements{}.setSize(32).setAlignment(8).setMemoryTypeBits(1),
-        VmaAllocationCreateInfo{});
-    assert(allocation);
-    auto mapped = allocation->view().map();
-    assert(mapped && *mapped == mapped_bytes && vma_maps == 1);
-    assert(allocation->view().flush() && allocation->view().invalidate());
-    allocation->view().unmap();
-    assert(vma_flushes == 1 && vma_invalidates == 1 && vma_unmaps == 1);
-    assert(allocation->view().information().size == 32);
-
-    VmaAllocationCreateInfo resource_allocation_info{};
-    resource_allocation_info.usage = VMA_MEMORY_USAGE_AUTO;
-    auto vma_buffer = allocator->createBuffer(
-        vk::BufferCreateInfo{}.setSize(64).setUsage(vk::BufferUsageFlagBits::TransferSrc),
-        resource_allocation_info);
-    auto vma_image = allocator->createImage(vk::ImageCreateInfo{}, resource_allocation_info);
-    assert(vma_buffer && vma_image);
-    assert(vma_buffer->createInfo() && vma_buffer->createInfo()->size == 64);
-    assert(vma_buffer->allocation() != VmaAllocation{} && vma_buffer->allocationInfo()->size == 64);
-    assert(vma_buffer->allocationCreateInfo()->usage == VMA_MEMORY_USAGE_AUTO);
-    allocator->reset();
-    assert(vma_allocator_destroys == 0);
-    allocation->reset();
-    assert(vma_allocation_frees == 1 && vma_allocator_destroys == 0);
-    vma_buffer->reset();
-    assert(vma_buffer_destroys == 1 && vma_allocator_destroys == 0);
-    vma_image->reset();
-    assert(vma_image_destroys == 1 && vma_allocator_destroys == 1);
     std::atomic_int ready{0};
     std::atomic_bool release_workers{false};
     std::vector<std::thread> workers;
@@ -919,8 +828,9 @@ def test_externsync_disabled_generates_a_working_wrapper(tmp_path: Path):
     compiler = _compiler()
     headers = _dependency("Vulkan-Headers")
     volk = _dependency("volk")
-    if not compiler or not headers or not volk:
-        pytest.skip("runtime C++ test needs a compiler, Vulkan-Headers, and Volk")
+    vma = _dependency("VulkanMemoryAllocator")
+    if not compiler or not headers or not volk or not vma:
+        pytest.skip("runtime C++ test needs a compiler, Vulkan-Headers, Volk, and VMA")
 
     generated = tmp_path / "vulkan_wrapper.hpp"
     assert (
@@ -977,6 +887,8 @@ int main() {
         str(tmp_path),
         "-I",
         str(volk),
+        "-I",
+        str(vma / "include"),
         "-I",
         str(headers / "include"),
         str(source),
