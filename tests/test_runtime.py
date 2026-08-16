@@ -928,7 +928,7 @@ def test_externsync_disabled_generates_a_working_wrapper(tmp_path: Path):
             [
                 "--registry",
                 str(headers / "registry" / "vk.xml"),
-                "--no-externsync",
+                "--set", "externsync=false",
                 "--emit", str(ROOT / "templates" / "vulkan-header-only.template.hpp") + ":" + str(generated),
             ]
         )

@@ -49,6 +49,58 @@ def _strings(value: object, key: str) -> tuple[str, ...]:
     return tuple(value)
 
 
+_STR_FIELDS = frozenset({"namespace", "module", "api", "minimum_core", "vma_include"})
+_BOOL_FIELDS = frozenset({"emit_docs", "externsync"})
+_LIST_FIELDS = frozenset(
+    {"include_extensions", "exclude_extensions", "exclude_commands", "exclude_types", "vma_functions"}
+)
+
+
+def _parse_bool(value: str, key: str) -> bool:
+    lowered = value.strip().lower()
+    if lowered in {"true", "1", "yes", "on"}:
+        return True
+    if lowered in {"false", "0", "no", "off"}:
+        return False
+    raise ConfigError(f"{key} expects a boolean value, got {value!r}")
+
+
+def _split_csv(value: str) -> tuple[str, ...]:
+    return tuple(item.strip() for item in value.split(",") if item.strip())
+
+
+def apply_overrides(
+    config: GeneratorConfig,
+    sets: dict[str, str],
+    adds: dict[str, list[str]],
+) -> None:
+    """Apply CLI ``--set`` (override) and ``--add`` (append) overrides.
+
+    ``sets`` maps a field name to a scalar (or a comma-separated list for list
+    fields, which replaces the whole list); ``adds`` maps a list field name to
+    the raw values to append. Unknown fields or wrong kinds raise ConfigError.
+    """
+    for key, value in sets.items():
+        if key in _STR_FIELDS:
+            setattr(config, key, value)
+        elif key in _BOOL_FIELDS:
+            setattr(config, key, _parse_bool(value, key))
+        elif key in _LIST_FIELDS:
+            setattr(config, key, _split_csv(value))
+        else:
+            raise ConfigError(f"unknown config option {key!r}")
+    for key, values in adds.items():
+        if key in _LIST_FIELDS:
+            current = list(getattr(config, key))
+            for value in values:
+                current.extend(_split_csv(value))
+            setattr(config, key, tuple(current))
+        elif key in _STR_FIELDS or key in _BOOL_FIELDS:
+            raise ConfigError(f"{key} is not a list option; use --set to override it")
+        else:
+            raise ConfigError(f"unknown config option {key!r}")
+
+
 def load_config(path: Path | None = None) -> GeneratorConfig:
     if path is None:
         return GeneratorConfig()

@@ -598,7 +598,7 @@ def test_externsync_shared_locks_and_config_option(tmp_path):
             [
                 "--registry",
                 str(FIXTURE),
-                "--no-externsync",
+                "--set", "externsync=false",
                 "--emit", str(ROOT / "templates" / "vulkan-header-only.template.hpp") + ":" + str(flagged),
             ]
         )
@@ -606,6 +606,28 @@ def test_externsync_shared_locks_and_config_option(tmp_path):
     )
     flagged_text = flagged.read_text(encoding="utf-8")
     assert "externsync_states" not in flagged_text
+
+
+def test_cli_set_and_add_config_overrides(tmp_path):
+    output = tmp_path / "wrapper.hpp"
+    assert (
+        run(
+            [
+                "--registry",
+                str(FIXTURE),
+                "--set", "namespace=custom",
+                "--add", "exclude_commands=vkCreateBuffer",
+                "--emit", str(ROOT / "templates" / "vulkan-header-only.template.hpp") + ":" + str(output),
+            ]
+        )
+        == 0
+    )
+    generated = output.read_text(encoding="utf-8")
+    assert "namespace custom {" in generated
+    assert "namespace vk {" not in generated
+    # --add appends to the exclusion list; vkCreateBuffer disappears.
+    assert "createBuffer" not in generated
+    assert "vkDestroyBuffer" not in generated
 
 
 def test_commands_rehome_to_owned_second_handle(tmp_path):

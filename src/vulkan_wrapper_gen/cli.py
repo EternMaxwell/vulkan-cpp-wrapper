@@ -4,7 +4,7 @@ import argparse
 from pathlib import Path
 import sys
 
-from .config import ConfigError, load_config
+from .config import ConfigError, apply_overrides, load_config
 from .emitter import emit_sections
 from .ir import RegistryError, build_ir
 from .naming import strip_vk
@@ -39,9 +39,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--vma-header", type=Path, help="Optional vk_mem_alloc.h parsed with libclang")
     parser.add_argument("--clang-arg", action="append", default=[], help="Argument forwarded to libclang")
     parser.add_argument("--config", type=Path, help="Versioned TOML generator configuration")
-    parser.add_argument("--namespace", help="Override the configured C++ namespace")
-    parser.add_argument("--no-externsync", action="store_true",
-                        help="Disable externsync locking in generated commands")
+    parser.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
+                        help="Override a config option (repeatable; list options are replaced)")
+    parser.add_argument("--add", action="append", default=[], metavar="KEY=VALUE",
+                        help="Append values to a list config option (repeatable, comma-separated)")
     parser.add_argument("--emit", action="append", metavar="TEMPLATE:OUTPUT",
                         help="Render TEMPLATE to OUTPUT; repeat for a header/source pair")
     parser.add_argument("--emit-ir", type=Path,
@@ -52,13 +53,25 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _split_key_value(spec: str) -> tuple[str, str]:
+    key, separator, value = spec.partition("=")
+    if not separator or not key.strip():
+        raise TemplateError(f"--set/--add must be KEY=VALUE, got {spec!r}")
+    return key.strip(), value
+
+
 def run(arguments: list[str] | None = None) -> int:
     args = _parser().parse_args(arguments)
     config = load_config(args.config)
-    if args.namespace:
-        config.namespace = args.namespace
-    if args.no_externsync:
-        config.externsync = False
+    sets: dict[str, str] = {}
+    for spec in args.set:
+        key, value = _split_key_value(spec)
+        sets[key] = value
+    adds: dict[str, list[str]] = {}
+    for spec in args.add:
+        key, value = _split_key_value(spec)
+        adds.setdefault(key, []).append(value)
+    apply_overrides(config, sets, adds)
     if args.emit_ir:
         ir = build_ir(
             args.registry,

@@ -64,7 +64,7 @@ find_package(Python3 REQUIRED COMPONENTS Interpreter)
 option(VULKAN_WRAPPER_EXTERNSYNC "Generate externsync locking in the wrapper" ON)
 set(WRAPPER_SYNC_FLAG "")
 if (NOT VULKAN_WRAPPER_EXTERNSYNC)
-    set(WRAPPER_SYNC_FLAG --no-externsync)
+    set(WRAPPER_SYNC_FLAG --set externsync=false)
 endif()
 set(WRAPPER ${CMAKE_BINARY_DIR}/generated/vulkan_wrapper.hpp)
 file(GLOB_RECURSE WRAPPER_GEN_SOURCES
