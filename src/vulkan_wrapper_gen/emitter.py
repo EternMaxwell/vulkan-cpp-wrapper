@@ -1712,7 +1712,7 @@ def _externsync_lines(
                 [
                     f"for (const auto& value : {span}) {{",
                     f"    auto lock = detail::ExternsyncAccess::collect(value.{member}, true, externsync_states);",
-                    f"    if (!lock) {{ {failure} }}",
+                    f"    if (!lock) {{\n        {failure}\n    }}",
                     "}",
                 ]
             )
@@ -1722,7 +1722,7 @@ def _externsync_lines(
                 [
                     f"for (const auto& value : {expression}) {{",
                     "    auto lock = detail::ExternsyncAccess::collect(value, true, externsync_states);",
-                    f"    if (!lock) {{ {failure} }}",
+                    f"    if (!lock) {{\n        {failure}\n    }}",
                     "}",
                 ]
             )
@@ -1733,7 +1733,7 @@ def _externsync_lines(
                 [
                     f"if ({expression}) {{",
                     f"    auto lock = detail::ExternsyncAccess::collect({expression}, true, externsync_states);",
-                    f"    if (!lock) {{ {failure} }}",
+                    f"    if (!lock) {{\n        {failure}\n    }}",
                     "}",
                 ]
             )
@@ -1741,7 +1741,7 @@ def _externsync_lines(
             lines.extend(
                 [
                     f"auto externsync_lock_{index} = detail::ExternsyncAccess::collect({expression}, true, externsync_states);",
-                    f"if (!externsync_lock_{index}) {{ auto& lock = externsync_lock_{index}; {failure} }}",
+                    f"if (!externsync_lock_{index}) {{\n    auto& lock = externsync_lock_{index};\n    {failure}\n}}",
                 ]
             )
     for index, (object_type, object_handle) in enumerate(dynamic_targets):
@@ -1751,21 +1751,21 @@ def _externsync_lines(
         lines.extend(
             [
                 f"auto externsync_dynamic_{index} = detail::ExternsyncAccess::collect({association}, {object_type}, static_cast<std::uint64_t>({object_handle}), true, externsync_states);",
-                f"if (!externsync_dynamic_{index}) {{ auto& lock = externsync_dynamic_{index}; {failure} }}",
+                f"if (!externsync_dynamic_{index}) {{\n    auto& lock = externsync_dynamic_{index};\n    {failure}\n}}",
             ]
         )
     if parent_exclusive:
         lines.extend(
             [
                 "auto externsync_parent = detail::ExternsyncAccess::collect(this->parent(), true, externsync_states);",
-                f"if (!externsync_parent) {{ auto& lock = externsync_parent; {failure} }}",
+                f"if (!externsync_parent) {{\n    auto& lock = externsync_parent;\n    {failure}\n}}",
             ]
         )
     if receiver_exclusive:
         lines.extend(
             [
                 "auto externsync_receiver = detail::ExternsyncAccess::collect(*this, true, externsync_states);",
-                f"if (!externsync_receiver) {{ auto& lock = externsync_receiver; {failure} }}",
+                f"if (!externsync_receiver) {{\n    auto& lock = externsync_receiver;\n    {failure}\n}}",
             ]
         )
     for index, (expression, is_span, is_optional) in enumerate(shared_targets):
@@ -1774,7 +1774,7 @@ def _externsync_lines(
                 [
                     f"for (const auto& value : {expression}) {{",
                     "    auto lock = detail::ExternsyncAccess::collect(value, false, externsync_states);",
-                    f"    if (!lock) {{ {failure} }}",
+                    f"    if (!lock) {{\n        {failure}\n    }}",
                     "}",
                 ]
             )
@@ -1783,7 +1783,7 @@ def _externsync_lines(
                 [
                     f"if ({expression}) {{",
                     f"    auto lock = detail::ExternsyncAccess::collect({expression}, false, externsync_states);",
-                    f"    if (!lock) {{ {failure} }}",
+                    f"    if (!lock) {{\n        {failure}\n    }}",
                     "}",
                 ]
             )
@@ -1791,7 +1791,7 @@ def _externsync_lines(
             lines.extend(
                 [
                     f"auto externsync_shared_{index} = detail::ExternsyncAccess::collect({expression}, false, externsync_states);",
-                    f"if (!externsync_shared_{index}) {{ auto& lock = externsync_shared_{index}; {failure} }}",
+                    f"if (!externsync_shared_{index}) {{\n    auto& lock = externsync_shared_{index};\n    {failure}\n}}",
                 ]
             )
     lines.append("detail::StateLocks externsync_locks(externsync_states);")
@@ -2026,6 +2026,21 @@ def _is_owned_handle_output(command: Command, param: Param) -> bool:
     return param.name in command.owned_outputs
 
 
+def _prefix_lines(text: str, prefix: str) -> str:
+    """Prefix every non-empty line of a (possibly multi-line) string."""
+    return "\n".join(f"{prefix}{line}" if line else "" for line in text.splitlines())
+
+
+def _indent_body(body: str) -> str:
+    """Indent every non-empty line of a generated function body by one level."""
+    return _prefix_lines(body, "    ")
+
+
+def _make_owned_call(cpp: str, args: list[str]) -> str:
+    """Build a multi-line ``makeOwned(...)`` call, re-indenting multi-line args."""
+    return f"{cpp}::makeOwned(\n" + ",\n".join(_prefix_lines(arg, "    ") for arg in args) + "\n)"
+
+
 def _releaser_command(handle_general: str, ir: IrRegistry) -> Command | None:
     handle = _as_handle(ir, handle_general)
     if handle is None or handle.releaser is None:
@@ -2179,13 +2194,12 @@ def _handle_release_lambda(
         ]
     )
     capture_list = ", ".join(captures)
-    indented = " ".join(body)
     owner_parameter = (
         f"const {_cpp_type(immediate_parent, ir, config)}& owner, "
         if immediate_parent is not None
         else ""
     )
-    return f"[{capture_list}]({owner_parameter}{output.c_type} value) noexcept {{ {indented} }}"
+    return f"[{capture_list}]({owner_parameter}{output.c_type} value) noexcept {{\n{_indent_body(chr(10).join(body))}\n}}"
 
 
 def _handle_ownership_condition(
@@ -2594,7 +2608,7 @@ def _command_parts(
                             failure_cleanup.extend(
                                 [
                                     f"if ({ownership_condition}) {{",
-                                    *(f"    {line}" for line in cleanup_lines),
+                                    *(_prefix_lines(line, "    ") for line in cleanup_lines),
                                     "}",
                                 ]
                             )
@@ -2605,13 +2619,13 @@ def _command_parts(
                         borrow_wrap += f", {parent}"
                     borrow_wrap += ")"
                     if owned:
-                        adopt_wrap = f"{cpp}::makeOwned({public}_native[i]"
+                        adopt_args = [f"{public}_native[i]"]
                         if parent:
-                            adopt_wrap += f", {parent}"
-                        adopt_wrap += f", {destroyer}"
+                            adopt_args.append(f"{parent}")
+                        adopt_args.append(destroyer)
                         if ir.handles[param.type].create_info:
-                            adopt_wrap += f", {record or '{}'}"
-                        adopt_wrap += ")"
+                            adopt_args.append(f"{record or '{}'}")
+                        adopt_wrap = _make_owned_call(cpp, adopt_args)
                         wrap = (
                             f"({ownership_condition} ? {adopt_wrap} : {borrow_wrap})"
                             if ownership_condition
@@ -2801,7 +2815,7 @@ def _command_parts(
                     )
                     cleanup_lines = [
                         f"if ({public}_native != {param.c_type}{{}}) {{",
-                        f"    auto {public}_cleanup = {destroyer};",
+                        _prefix_lines(f"auto {public}_cleanup = {destroyer};", "    "),
                         f"    {cleanup_call};",
                         "}",
                     ]
@@ -2820,13 +2834,13 @@ def _command_parts(
                     borrow_wrap += f", {parent}"
                 borrow_wrap += ")"
                 if owned:
-                    adopt_wrap = f"{cpp}::makeOwned({public}_native"
+                    adopt_args = [f"{public}_native"]
                     if parent:
-                        adopt_wrap += f", {parent}"
-                    adopt_wrap += f", {destroyer}"
+                        adopt_args.append(f"{parent}")
+                    adopt_args.append(destroyer)
                     if ir.handles[param.type].create_info:
-                        adopt_wrap += f", {record or '{}'}"
-                    adopt_wrap += ")"
+                        adopt_args.append(f"{record or '{}'}")
+                    adopt_wrap = _make_owned_call(cpp, adopt_args)
                     wrap = (
                         f"({ownership_condition} ? {adopt_wrap} : {borrow_wrap})"
                         if ownership_condition
@@ -2849,11 +2863,34 @@ def _command_parts(
                 )
                 if is_value_output:
                     postlude.append(
-                        f"if ({public}_native != {param.c_type}{{}}) {{ auto wrapped = {wrap}; if (!wrapped) {{ {failure} }} else {public} = std::move(*wrapped); }}"
+                        "\n".join(
+                            [
+                                f"if ({public}_native != {param.c_type}{{}}) {{",
+                                _prefix_lines(f"auto wrapped = {wrap};", "    "),
+                                "    if (!wrapped) {",
+                                f"        {failure}",
+                                "    }",
+                                f"    {public} = std::move(*wrapped);",
+                                "}",
+                            ]
+                        )
                     )
                 else:
                     postlude.append(
-                        f"if ({public}) {{ if ({public}_native == {param.c_type}{{}}) {public}->reset(); else {{ auto wrapped = {wrap}; if (!wrapped) {{ {failure} }} else *{public} = std::move(*wrapped); }} }}"
+                        "\n".join(
+                            [
+                                f"if ({public}) {{",
+                                f"    if ({public}_native == {param.c_type}{{}}) {public}->reset();",
+                                "    else {",
+                                _prefix_lines(f"auto wrapped = {wrap};", "        "),
+                                "        if (!wrapped) {",
+                                f"            {failure}",
+                                "        }",
+                                f"        *{public} = std::move(*wrapped);",
+                                "    }",
+                                "}",
+                            ]
+                        )
                     )
             continue
 
@@ -2970,7 +3007,7 @@ def _command_parts(
         body.append(f"auto status = static_cast<ResultCode>({call});")
         if failure_cleanup:
             body.append("if (static_cast<std::int32_t>(status) < 0) {")
-            body.extend(f"    {line}" for line in failure_cleanup)
+            body.extend(_prefix_lines(line, "    ") for line in failure_cleanup)
             body.append(
                 f"    return {result}{{status, {{}}}};"
                 if status_value_result
@@ -3031,7 +3068,7 @@ def _method_impl(
     if not body:
         return ""
     receiver_name = _cpp_type(receiver, ir, config)
-    return f"inline {result} {receiver_name}::{_method_name(command, receiver, config)}({params}) const {{ {body} }}"
+    return f"inline {result} {receiver_name}::{_method_name(command, receiver, config)}({params}) const {{\n{_indent_body(body)}\n}}"
 
 
 def _convenience_parts(
@@ -3282,7 +3319,7 @@ def _convenience_parts(
             *struct_prepare,
             f"        auto status = static_cast<ResultCode>({call});",
         ]
-    body.extend(f"        {line}" for line in postlude)
+    body.extend(_prefix_lines(line, "        ") for line in postlude)
     category = vector_category
     if vector.type == "void":
         body.append("        auto values = std::move(native_values);")
@@ -3340,7 +3377,7 @@ def _convenience_parts(
                 "        return values;",
             ]
         )
-    body = [*(f"        {line}" for line in prelude), *body]
+    body = [*(_prefix_lines(line, "        ") for line in prelude), *body]
     return (
         result_type,
         ", ".join(params),
@@ -3480,23 +3517,43 @@ def _owned_handle_convenience_parts(
         value_type = f"std::vector<{cpp}>"
         if command.c_return_type == "VkResult":
             result = f"Result<{value_type}>"
-            body = (
-                f"{value_type} values(static_cast<std::size_t>({size})); auto status = {method}({call_arguments}); "
-                "if (!status) return std::unexpected(status.error()); return values;"
+            body = "\n".join(
+                [
+                    f"{value_type} values(static_cast<std::size_t>({size}));",
+                    f"auto status = {method}({call_arguments});",
+                    "if (!status) return std::unexpected(status.error());",
+                    "return values;",
+                ]
             )
         else:
             result = value_type
-            body = f"{value_type} values(static_cast<std::size_t>({size})); {method}({call_arguments}); return values;"
+            body = "\n".join(
+                [
+                    f"{value_type} values(static_cast<std::size_t>({size}));",
+                    f"{method}({call_arguments});",
+                    "return values;",
+                ]
+            )
     else:
         if command.c_return_type == "VkResult":
             result = f"Result<{cpp}>"
-            body = (
-                f"{cpp} value{{}}; auto status = {method}({call_arguments}); "
-                "if (!status) return std::unexpected(status.error()); return value;"
+            body = "\n".join(
+                [
+                    f"{cpp} value{{}};",
+                    f"auto status = {method}({call_arguments});",
+                    "if (!status) return std::unexpected(status.error());",
+                    "return value;",
+                ]
             )
         else:
             result = cpp
-            body = f"{cpp} value{{}}; {method}({call_arguments}); return value;"
+            body = "\n".join(
+                [
+                    f"{cpp} value{{}};",
+                    f"{method}({call_arguments});",
+                    "return value;",
+                ]
+            )
     return result, params, body
 
 
@@ -3526,7 +3583,7 @@ def _owned_handle_convenience_impl(
     receiver_name = (
         _cpp_type(receiver, ir, config) if receiver is not None else "Context"
     )
-    return f"inline {result} {receiver_name}::{_callable_name(command, receiver, config)}({params}) const {{ {body} }}"
+    return f"inline {result} {receiver_name}::{_callable_name(command, receiver, config)}({params}) const {{\n{_indent_body(body)}\n}}"
 
 
 def _multi_output_parts(
@@ -3600,7 +3657,7 @@ def _multi_output_impl(
     receiver_name = (
         _cpp_type(receiver, ir, config) if receiver is not None else "Context"
     )
-    return f"inline {result} {receiver_name}::{_callable_name(command, receiver, config)}({params}) const {{ {body} }}"
+    return f"inline {result} {receiver_name}::{_callable_name(command, receiver, config)}({params}) const {{\n{_indent_body(body)}\n}}"
 
 
 # ---------------------------------------------------------------------------
@@ -4040,24 +4097,61 @@ def _emit_handle_lifetime_impl(
     )
     adoption = f", const {parent}& parent" if parent else ""
     borrowed_ctor = f"{name}(native, parent)" if parent else f"{name}(native)"
+    borrow_lines = [
+        "if (native == native_type{}) return std::unexpected(ResultCode::ErrorUnknown);",
+    ]
     if handle.c_name == "VkDevice":
-        borrow_body = f"if (native == native_type{{}}) return std::unexpected(ResultCode::ErrorUnknown); std::shared_lock lock(detail::{state_name}::tracking_mutex); auto [first, last] = detail::{state_name}::registry.equal_range(detail::raw_key(native)); for (auto found = first; found != last; ++found) if (detail::same_object(found->second->parent, parent)) {{ found->second->retain(); return {name}(found->second); }} lock.unlock(); return {borrowed_ctor};"
+        borrow_lines.extend(
+            [
+                f"std::shared_lock lock(detail::{state_name}::tracking_mutex);",
+                f"auto [first, last] = detail::{state_name}::registry.equal_range(detail::raw_key(native));",
+                f"for (auto found = first; found != last; ++found) if (detail::same_object(found->second->parent, parent)) {{",
+                f"    found->second->retain(); return {name}(found->second);",
+                "}",
+                "lock.unlock();",
+                f"return {borrowed_ctor};",
+            ]
+        )
     else:
         if device_scope:
-            lookup = f"auto association = parent.deviceAssociation(); if (association && {object_type} != VK_OBJECT_TYPE_UNKNOWN) {{ std::shared_lock lock(detail::{state_name}::tracking_mutex); std::shared_lock association_lock(*association.mutex); std::uint64_t existing{{}}; association.dispatch->vkGetPrivateData(association.device, {object_type}, detail::raw_key(native), association.slot, &existing); if (existing) {{ auto* state = static_cast<detail::{state_name}*>(reinterpret_cast<detail::LifetimeHeader*>(static_cast<std::uintptr_t>(existing))); state->retain(); return {name}(state); }} }}"
+            borrow_lines.extend(
+                [
+                    "auto association = parent.deviceAssociation();",
+                    f"if (association && {object_type} != VK_OBJECT_TYPE_UNKNOWN) {{",
+                    f"    std::shared_lock lock(detail::{state_name}::tracking_mutex);",
+                    "    std::shared_lock association_lock(*association.mutex);",
+                    "    std::uint64_t existing{};",
+                    f"    association.dispatch->vkGetPrivateData(association.device, {object_type}, detail::raw_key(native), association.slot, &existing);",
+                    "    if (existing) {",
+                    f"        auto* state = static_cast<detail::{state_name}*>(reinterpret_cast<detail::LifetimeHeader*>(static_cast<std::uintptr_t>(existing)));",
+                    "        state->retain();",
+                    f"        return {name}(state);",
+                    "    }",
+                    "}",
+                ]
+            )
         else:
             parent_filter = (
                 f" && detail::same_object(found->second->parent, parent)"
                 if parent
                 else ""
             )
-            lookup = f"std::shared_lock lock(detail::{state_name}::tracking_mutex); auto [first, last] = detail::{state_name}::registry.equal_range(detail::raw_key(native)); for (auto found = first; found != last; ++found) if (found->second{parent_filter}) {{ found->second->retain(); return {name}(found->second); }} lock.unlock();"
-        borrow_body = f"if (native == native_type{{}}) return std::unexpected(ResultCode::ErrorUnknown); {lookup} auto value = {borrowed_ctor};"
+            borrow_lines.extend(
+                [
+                    f"std::shared_lock lock(detail::{state_name}::tracking_mutex);",
+                    f"auto [first, last] = detail::{state_name}::registry.equal_range(detail::raw_key(native));",
+                    f"for (auto found = first; found != last; ++found) if (found->second{parent_filter}) {{",
+                    f"    found->second->retain(); return {name}(found->second);",
+                    "}",
+                    "lock.unlock();",
+                ]
+            )
+        borrow_lines.append(f"auto value = {borrowed_ctor};")
         if handle.c_name == "VkInstance":
-            borrow_body += " volkLoadInstanceTable(&value.dispatch_, native);"
-        borrow_body += " return value;"
+            borrow_lines.append("volkLoadInstanceTable(&value.dispatch_, native);")
+        borrow_lines.append("return value;")
     lines.append(
-        f"inline Result<{name}> {name}::borrow(native_type native{adoption}) {{ {borrow_body} }}"
+        f"inline Result<{name}> {name}::borrow(native_type native{adoption}) {{\n{_indent_body(chr(10).join(borrow_lines))}\n}}"
     )
     create_info_arg = ""
     if handle.create_info:
@@ -4076,14 +4170,14 @@ def _emit_handle_lifetime_impl(
         make_lines.extend(
             [
                 "    auto association = parent.deviceAssociation();",
-                f"    if (!association || {object_type} == VK_OBJECT_TYPE_UNKNOWN) {{ {offered_destroy}; return std::unexpected(ResultCode::ErrorUnknown); }}",
+                f"    if (!association || {object_type} == VK_OBJECT_TYPE_UNKNOWN) {{\n        {offered_destroy};\n        return std::unexpected(ResultCode::ErrorUnknown);\n    }}",
                 "    std::unique_lock association_lock(*association.mutex);",
                 f"    auto* state = new (std::nothrow) detail::{state_name};",
-                f"    if (!state) {{ association_lock.unlock(); {offered_destroy}; return std::unexpected(ResultCode::ErrorOutOfHostMemory); }}",
+                f"    if (!state) {{\n        association_lock.unlock();\n        {offered_destroy};\n        return std::unexpected(ResultCode::ErrorOutOfHostMemory);\n    }}",
                 "    state->native = native;",
                 "    state->parent = parent;",
                 f"    auto status = association.dispatch->vkSetPrivateData(association.device, {object_type}, detail::raw_key(native), association.slot, static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(static_cast<detail::LifetimeHeader*>(state))));",
-                f"    if (status != VK_SUCCESS) {{ association_lock.unlock(); delete state; {offered_destroy}; return std::unexpected(static_cast<ResultCode>(status)); }}",
+                f"    if (status != VK_SUCCESS) {{\n        association_lock.unlock();\n        delete state;\n        {offered_destroy};\n        return std::unexpected(static_cast<ResultCode>(status));\n    }}",
             ]
         )
     else:
@@ -4091,7 +4185,7 @@ def _emit_handle_lifetime_impl(
             [
                 f"    std::unique_lock lock(detail::{state_name}::tracking_mutex);",
                 f"    auto* state = new (std::nothrow) detail::{state_name};",
-                f"    if (!state) {{ lock.unlock(); {offered_destroy}; return std::unexpected(ResultCode::ErrorOutOfHostMemory); }}",
+                f"    if (!state) {{\n        lock.unlock();\n        {offered_destroy};\n        return std::unexpected(ResultCode::ErrorOutOfHostMemory);\n    }}",
                 "    state->native = native;",
             ]
         )
@@ -4110,9 +4204,9 @@ def _emit_handle_lifetime_impl(
                     "    state->device_association.mutex = &state->private_data_mutex;",
                     "    VkPrivateDataSlotCreateInfo info{VK_STRUCTURE_TYPE_PRIVATE_DATA_SLOT_CREATE_INFO};",
                     "    auto setup_status = state->device_dispatch.vkCreatePrivateDataSlot(native, &info, nullptr, &state->device_association.slot);",
-                    f"    if (setup_status != VK_SUCCESS) {{ delete state; lock.unlock(); {offered_destroy}; return std::unexpected(static_cast<ResultCode>(setup_status)); }}",
+                    f"    if (setup_status != VK_SUCCESS) {{\n        delete state;\n        lock.unlock();\n        {offered_destroy};\n        return std::unexpected(static_cast<ResultCode>(setup_status));\n    }}",
                     "    setup_status = state->device_dispatch.vkSetPrivateData(native, VK_OBJECT_TYPE_DEVICE, detail::raw_key(native), state->device_association.slot, static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(static_cast<detail::LifetimeHeader*>(state))));",
-                    f"    if (setup_status != VK_SUCCESS) {{ state->device_dispatch.vkDestroyPrivateDataSlot(native, state->device_association.slot, nullptr); delete state; lock.unlock(); {offered_destroy}; return std::unexpected(static_cast<ResultCode>(setup_status)); }}",
+                    f"    if (setup_status != VK_SUCCESS) {{\n        state->device_dispatch.vkDestroyPrivateDataSlot(native, state->device_association.slot, nullptr);\n        delete state;\n        lock.unlock();\n        {offered_destroy};\n        return std::unexpected(static_cast<ResultCode>(setup_status));\n    }}",
                 ]
             )
         make_lines.append(
@@ -4137,7 +4231,7 @@ def _emit_handle_lifetime_impl(
                 "        std::shared_lock association_lock(*association.mutex);",
                 "        std::uint64_t existing{};",
                 f"        association.dispatch->vkGetPrivateData(association.device, {object_type}, detail::raw_key(native), association.slot, &existing);",
-                f"        if (existing) {{ auto* state = static_cast<detail::{state_name}*>(reinterpret_cast<detail::LifetimeHeader*>(static_cast<std::uintptr_t>(existing))); state->retain(); return {name}(state); }}",
+                f"        if (existing) {{\n            auto* state = static_cast<detail::{state_name}*>(reinterpret_cast<detail::LifetimeHeader*>(static_cast<std::uintptr_t>(existing)));\n            state->retain();\n            return {name}(state);\n        }}",
                 "    }",
             ]
         )
@@ -4149,7 +4243,7 @@ def _emit_handle_lifetime_impl(
             [
                 f"    std::shared_lock lock(detail::{state_name}::tracking_mutex);",
                 f"    auto [first, last] = detail::{state_name}::registry.equal_range(detail::raw_key(native));",
-                f"    for (auto found = first; found != last; ++found) if (found->second{parent_filter}) {{ found->second->retain(); return {name}(found->second); }}",
+                f"    for (auto found = first; found != last; ++found) if (found->second{parent_filter}) {{\n        found->second->retain();\n        return {name}(found->second);\n    }}",
                 "    lock.unlock();",
             ]
         )
@@ -4233,10 +4327,62 @@ def _emit_handle_template_implementations(
             continue
         name = _cpp_type(handle.name, ir, config)
         definitions = [
-            f"template <typename T> inline Result<void> {name}::setUserData(std::shared_ptr<const T> value) const {{ if (!ctrl_) return std::unexpected(ResultCode::ErrorUnknown); std::unique_lock lock(ctrl_->user_data_mutex); try {{ if (!ctrl_->data) ctrl_->data = std::make_unique<std::unordered_map<std::type_index, std::shared_ptr<const void>>>(); ctrl_->data->insert_or_assign(typeid(T), std::move(value)); }} catch (...) {{ return std::unexpected(ResultCode::ErrorOutOfHostMemory); }} return {{}}; }}",
-            f"template <typename T> inline std::shared_ptr<const T> {name}::getUserData() const noexcept {{ if (!ctrl_) return nullptr; std::shared_lock lock(ctrl_->user_data_mutex); if (!ctrl_->data) return nullptr; auto found = ctrl_->data->find(typeid(T)); return found == ctrl_->data->end() ? nullptr : std::static_pointer_cast<const T>(found->second); }}",
-            f"template <typename T, typename Factory> inline std::shared_ptr<const T> {name}::getOrSetUserData(Factory&& factory) const {{ if (!ctrl_) return nullptr; std::unique_lock lock(ctrl_->user_data_mutex); if (ctrl_->data) {{ auto found = ctrl_->data->find(typeid(T)); if (found != ctrl_->data->end()) return std::static_pointer_cast<const T>(found->second); }} std::shared_ptr<const T> value = std::invoke(std::forward<Factory>(factory)); if (!value) return nullptr; try {{ if (!ctrl_->data) ctrl_->data = std::make_unique<std::unordered_map<std::type_index, std::shared_ptr<const void>>>(); ctrl_->data->insert_or_assign(typeid(T), value); }} catch (...) {{ return nullptr; }} return value; }}",
-            f"template <typename T> inline void {name}::clearUserData() const noexcept {{ if (!ctrl_) return; std::unique_lock lock(ctrl_->user_data_mutex); if (ctrl_->data) ctrl_->data->erase(typeid(T)); }}",
+            "\n".join(
+                [
+                    f"template <typename T> inline Result<void> {name}::setUserData(std::shared_ptr<const T> value) const {{",
+                    "    if (!ctrl_) return std::unexpected(ResultCode::ErrorUnknown);",
+                    "    std::unique_lock lock(ctrl_->user_data_mutex);",
+                    "    try {",
+                    "        if (!ctrl_->data) ctrl_->data = std::make_unique<std::unordered_map<std::type_index, std::shared_ptr<const void>>>();",
+                    "        ctrl_->data->insert_or_assign(typeid(T), std::move(value));",
+                    "    } catch (...) {",
+                    "        return std::unexpected(ResultCode::ErrorOutOfHostMemory);",
+                    "    }",
+                    "    return {};",
+                    "}",
+                ]
+            ),
+            "\n".join(
+                [
+                    f"template <typename T> inline std::shared_ptr<const T> {name}::getUserData() const noexcept {{",
+                    "    if (!ctrl_) return nullptr;",
+                    "    std::shared_lock lock(ctrl_->user_data_mutex);",
+                    "    if (!ctrl_->data) return nullptr;",
+                    "    auto found = ctrl_->data->find(typeid(T));",
+                    "    return found == ctrl_->data->end() ? nullptr : std::static_pointer_cast<const T>(found->second);",
+                    "}",
+                ]
+            ),
+            "\n".join(
+                [
+                    f"template <typename T, typename Factory> inline std::shared_ptr<const T> {name}::getOrSetUserData(Factory&& factory) const {{",
+                    "    if (!ctrl_) return nullptr;",
+                    "    std::unique_lock lock(ctrl_->user_data_mutex);",
+                    "    if (ctrl_->data) {",
+                    "        auto found = ctrl_->data->find(typeid(T));",
+                    "        if (found != ctrl_->data->end()) return std::static_pointer_cast<const T>(found->second);",
+                    "    }",
+                    "    std::shared_ptr<const T> value = std::invoke(std::forward<Factory>(factory));",
+                    "    if (!value) return nullptr;",
+                    "    try {",
+                    "        if (!ctrl_->data) ctrl_->data = std::make_unique<std::unordered_map<std::type_index, std::shared_ptr<const void>>>();",
+                    "        ctrl_->data->insert_or_assign(typeid(T), value);",
+                    "    } catch (...) {",
+                    "        return nullptr;",
+                    "    }",
+                    "    return value;",
+                    "}",
+                ]
+            ),
+            "\n".join(
+                [
+                    f"template <typename T> inline void {name}::clearUserData() const noexcept {{",
+                    "    if (!ctrl_) return;",
+                    "    std::unique_lock lock(ctrl_->user_data_mutex);",
+                    "    if (ctrl_->data) ctrl_->data->erase(typeid(T));",
+                    "}",
+                ]
+            ),
         ]
         result.append(
             _guard(
@@ -4341,7 +4487,7 @@ def _emit_context_implementations(
         if body:
             lines.append(
                 _guard(
-                    f"inline {result} Context::{command.cpp_name}({params}) const {{ {body} }}",
+                    f"inline {result} Context::{command.cpp_name}({params}) const {{\n{_indent_body(body)}\n}}",
                     command.protect or command.availability.protect,
                 )
             )

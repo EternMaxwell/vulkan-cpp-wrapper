@@ -696,7 +696,8 @@ def test_header_only_generation_is_deterministic(tmp_path):
     assert "claim_owner_control_block" not in first
     assert "ensure_observer_control_block" not in first
     assert "adoptManaged(" not in first
-    assert "state->retain(); return Buffer(state); }" in first
+    assert "state->retain();" in first
+    assert "return Buffer(state);" in first
     assert "return makeOwned(native, parent," in first
     assert "fromState(" not in first
     assert "reinterpret_cast<std::uintptr_t>(ctrl_)" in first
@@ -731,7 +732,7 @@ def test_header_only_generation_is_deterministic(tmp_path):
         in first
     )
     assert "detail::DispatchState{parent_.dispatchState().instance" not in first
-    assert "auto value = Buffer(native, parent); return value;" in first
+    assert "auto value = Buffer(native, parent);" in first
     assert "borrow_state" not in first
     fence = first[first.index("class Fence") :]
     fence = fence[: fence.index("};")]
