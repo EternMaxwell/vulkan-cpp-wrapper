@@ -438,6 +438,25 @@ int main() {
     assert(observer && observer->use_count() == 1);
     assert(observer->setUserData<int>(std::make_shared<const int>(7)));
     assert(*observer->getUserData<int>() == 7);
+    // getOrSetUserData runs the factory only on first use and reuses the cached
+    // value afterwards; a borrowed handle never invokes the factory.
+    int factory_calls = 0;
+    auto made = observer->getOrSetUserData<long>([&]() -> std::shared_ptr<const long> {
+        ++factory_calls;
+        return std::make_shared<const long>(11L);
+    });
+    assert(made && *made == 11L && factory_calls == 1);
+    auto reused = observer->getOrSetUserData<long>([&]() -> std::shared_ptr<const long> {
+        ++factory_calls;
+        return nullptr;
+    });
+    assert(reused && *reused == 11L && factory_calls == 1);
+    int borrowed_factory_calls = 0;
+    auto borrowed_made = pure_borrow->getOrSetUserData<long>([&]() -> std::shared_ptr<const long> {
+        ++borrowed_factory_calls;
+        return std::make_shared<const long>(99L);
+    });
+    assert(!borrowed_made && borrowed_factory_calls == 0);
     observer->reset();
     assert(observer_destroys == 1);
     pure_borrow->reset();

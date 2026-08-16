@@ -68,23 +68,22 @@ struct VmaAllocatorLifetime {
 } // namespace detail
 
 inline VmaAllocator Device::allocator() const {
-    if (auto cached = getUserData<detail::VmaAllocatorLifetime>()) return cached->allocator;
-    VmaAllocatorCreateInfo info{};
-    info.instance = parent().parent().raw();
-    info.physicalDevice = parent().raw();
-    info.device = raw();
-    info.vulkanApiVersion = VK_API_VERSION_1_3;
-    VmaVulkanFunctions functions{};
-    functions.vkGetInstanceProcAddr = vkGetInstanceProcAddr;
-    functions.vkGetDeviceProcAddr = vkGetDeviceProcAddr;
-    info.pVulkanFunctions = &functions;
-    VmaAllocator value{};
-    if (vmaCreateAllocator(&info, &value) != VK_SUCCESS || !value) return nullptr;
-    if (!setUserData<detail::VmaAllocatorLifetime>(
-            std::make_shared<const detail::VmaAllocatorLifetime>(value))) {
-        return nullptr;  // the shared_ptr just created is released and destroys the allocator
-    }
-    return value;
+    auto holder = getOrSetUserData<detail::VmaAllocatorLifetime>(
+        [this]() -> std::shared_ptr<const detail::VmaAllocatorLifetime> {
+            VmaAllocatorCreateInfo info{};
+            info.instance = parent().parent().raw();
+            info.physicalDevice = parent().raw();
+            info.device = raw();
+            info.vulkanApiVersion = VK_API_VERSION_1_3;
+            VmaVulkanFunctions functions{};
+            functions.vkGetInstanceProcAddr = vkGetInstanceProcAddr;
+            functions.vkGetDeviceProcAddr = vkGetDeviceProcAddr;
+            info.pVulkanFunctions = &functions;
+            VmaAllocator value{};
+            if (vmaCreateAllocator(&info, &value) != VK_SUCCESS || !value) return nullptr;
+            return std::make_shared<const detail::VmaAllocatorLifetime>(value);
+        });
+    return holder ? holder->allocator : nullptr;
 }
 
 inline Result<Buffer> Device::createAllocatedBuffer(

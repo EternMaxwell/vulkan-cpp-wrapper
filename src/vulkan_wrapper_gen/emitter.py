@@ -3641,6 +3641,7 @@ def _emit_handle(
         state_lines.append(f"    {parent} parent{{}};")
     state_lines.extend(
         [
+            "    mutable std::shared_mutex user_data_mutex;",
             "    std::unique_ptr<std::unordered_map<std::type_index, std::shared_ptr<const void>>> data;",
             f"    std::function<void({'const ' + parent + '&, ' if parent else ''}native_type)> destroyer;",
         ]
@@ -3689,7 +3690,8 @@ def _emit_handle(
     else:
         lines.append("    VolkInstanceTable dispatch_{};")
     lines.append(f"    mutable detail::{state_name}* ctrl_{{}};")
-    lines.append("    friend struct detail::ExternsyncAccess;")
+    if config.externsync:
+        lines.append("    friend struct detail::ExternsyncAccess;")
     lines.append("    friend struct detail::HandleAccess;")
     lines.append(
         "    template <typename Handle> friend bool detail::same_object(const Handle&, const Handle&) noexcept;"
@@ -3790,6 +3792,7 @@ def _emit_handle(
         [
             "    template <typename T> [[nodiscard]] Result<void> setUserData(std::shared_ptr<const T> value) const;",
             "    template <typename T> [[nodiscard]] std::shared_ptr<const T> getUserData() const noexcept;",
+            "    template <typename T, typename Factory> [[nodiscard]] std::shared_ptr<const T> getOrSetUserData(Factory&& factory) const;",
             "    template <typename T> void clearUserData() const noexcept;",
         ]
     )
@@ -3929,13 +3932,14 @@ def _emit_handle_lifetime_impl(
             ]
         )
     lines.append("}")
-    lines.extend(
-        [
-            f"inline void detail::{state_name}::finalize(detail::{state_name}* self) noexcept {{",
-            "    try {",
-        ]
-    )
-    lines.append("        std::unique_lock access(self->externsync);")
+    finalize_open = [
+        f"inline void detail::{state_name}::finalize(detail::{state_name}* self) noexcept {{",
+        "    try {",
+        "        self->data.reset();",
+    ]
+    if config.externsync:
+        finalize_open.append("        std::unique_lock access(self->externsync);")
+    lines.extend(finalize_open)
     if handle.c_name == "VkDevice":
         lines.extend(
             [
@@ -3960,10 +3964,6 @@ def _emit_handle_lifetime_impl(
                 "        }",
             ]
         )
-    # User data is destroyed before the native handle so that resources stored
-    # through setUserData (for example a VMA allocator cached on a Device) are
-    # released while the native handle is still valid.
-    lines.append("        self->data.reset();")
     destroy_call = (
         "self->destroyer(self->parent, self->native)"
         if parent
@@ -4233,9 +4233,10 @@ def _emit_handle_template_implementations(
             continue
         name = _cpp_type(handle.name, ir, config)
         definitions = [
-            f"template <typename T> inline Result<void> {name}::setUserData(std::shared_ptr<const T> value) const {{ if (!ctrl_) return std::unexpected(ResultCode::ErrorUnknown); std::unique_lock lock(ctrl_->externsync); try {{ if (!ctrl_->data) ctrl_->data = std::make_unique<std::unordered_map<std::type_index, std::shared_ptr<const void>>>(); ctrl_->data->insert_or_assign(typeid(T), std::move(value)); }} catch (...) {{ return std::unexpected(ResultCode::ErrorOutOfHostMemory); }} return {{}}; }}",
-            f"template <typename T> inline std::shared_ptr<const T> {name}::getUserData() const noexcept {{ if (!ctrl_) return nullptr; std::shared_lock lock(ctrl_->externsync); if (!ctrl_->data) return nullptr; auto found = ctrl_->data->find(typeid(T)); return found == ctrl_->data->end() ? nullptr : std::static_pointer_cast<const T>(found->second); }}",
-            f"template <typename T> inline void {name}::clearUserData() const noexcept {{ if (!ctrl_) return; std::unique_lock lock(ctrl_->externsync); if (ctrl_->data) ctrl_->data->erase(typeid(T)); }}",
+            f"template <typename T> inline Result<void> {name}::setUserData(std::shared_ptr<const T> value) const {{ if (!ctrl_) return std::unexpected(ResultCode::ErrorUnknown); std::unique_lock lock(ctrl_->user_data_mutex); try {{ if (!ctrl_->data) ctrl_->data = std::make_unique<std::unordered_map<std::type_index, std::shared_ptr<const void>>>(); ctrl_->data->insert_or_assign(typeid(T), std::move(value)); }} catch (...) {{ return std::unexpected(ResultCode::ErrorOutOfHostMemory); }} return {{}}; }}",
+            f"template <typename T> inline std::shared_ptr<const T> {name}::getUserData() const noexcept {{ if (!ctrl_) return nullptr; std::shared_lock lock(ctrl_->user_data_mutex); if (!ctrl_->data) return nullptr; auto found = ctrl_->data->find(typeid(T)); return found == ctrl_->data->end() ? nullptr : std::static_pointer_cast<const T>(found->second); }}",
+            f"template <typename T, typename Factory> inline std::shared_ptr<const T> {name}::getOrSetUserData(Factory&& factory) const {{ if (!ctrl_) return nullptr; std::unique_lock lock(ctrl_->user_data_mutex); if (ctrl_->data) {{ auto found = ctrl_->data->find(typeid(T)); if (found != ctrl_->data->end()) return std::static_pointer_cast<const T>(found->second); }} std::shared_ptr<const T> value = std::invoke(std::forward<Factory>(factory)); if (!value) return nullptr; try {{ if (!ctrl_->data) ctrl_->data = std::make_unique<std::unordered_map<std::type_index, std::shared_ptr<const void>>>(); ctrl_->data->insert_or_assign(typeid(T), value); }} catch (...) {{ return nullptr; }} return value; }}",
+            f"template <typename T> inline void {name}::clearUserData() const noexcept {{ if (!ctrl_) return; std::unique_lock lock(ctrl_->user_data_mutex); if (ctrl_->data) ctrl_->data->erase(typeid(T)); }}",
         ]
         result.append(
             _guard(
@@ -4403,11 +4404,12 @@ def _emit_command_metadata(ir: IrRegistry, config: GeneratorConfig) -> str:
 # Runtime prelude (unchanged verbatim from the previous emitter)
 # ---------------------------------------------------------------------------
 
-RUNTIME = r"""namespace detail {
+_RUNTIME_HEAD = r"""namespace detail {
 struct LifetimeHeader {
     std::atomic_uint64_t refs{1};
-    mutable std::shared_mutex externsync;
-    void retain() noexcept { refs.fetch_add(1, std::memory_order_relaxed); }
+"""
+_RUNTIME_EXTERNSYNC_MEMBER = "    mutable std::shared_mutex externsync;\n"
+_RUNTIME_CORE = r"""    void retain() noexcept { refs.fetch_add(1, std::memory_order_relaxed); }
     template <typename ControlBlock>
     void release(std::shared_mutex& mutex, ControlBlock* self, void (*detach)(ControlBlock*) noexcept, void (*finalize)(ControlBlock*) noexcept) noexcept {
         std::unique_lock lock(mutex);
@@ -4446,7 +4448,8 @@ template <typename Native> [[nodiscard]] std::uint64_t raw_key(Native value) noe
     if constexpr (std::is_pointer_v<Native>) return static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(value));
     else return static_cast<std::uint64_t>(value);
 }
-struct StateLockRef {
+"""
+_RUNTIME_EXTERNSYNC_BLOCK = r"""struct StateLockRef {
     std::uintptr_t identity{};
     std::shared_mutex* mutex{};
     bool exclusive{};
@@ -4501,7 +4504,8 @@ struct ExternsyncAccess {
         return {};
     }
 };
-template <typename Handle> [[nodiscard]] bool same_object(const Handle& left, const Handle& right) noexcept {
+"""
+_RUNTIME_TAIL = r"""template <typename Handle> [[nodiscard]] bool same_object(const Handle& left, const Handle& right) noexcept {
     if (!left.sameNativeHandle(right)) return false;
     if (left.ctrl_ && right.ctrl_) return left.ctrl_ == right.ctrl_;
     if constexpr (requires { left.parent(); }) return same_object(left.parent(), right.parent());
@@ -4511,6 +4515,19 @@ template <typename Handle> [[nodiscard]] bool same_object(const Handle& left, co
 using DestructionErrorSink = detail::ErrorSink;
 inline void setDestructionErrorSink(DestructionErrorSink sink) noexcept { detail::set_error_sink(sink); }
 [[nodiscard]] inline DestructionErrorSink destructionErrorSink() noexcept { return detail::error_sink.load(std::memory_order_acquire); }"""
+
+
+def _runtime(config: GeneratorConfig) -> str:
+    """Assemble the detail runtime, dropping the externsync mutex and its
+    locking helpers when external synchronization is disabled."""
+    parts = [_RUNTIME_HEAD]
+    if config.externsync:
+        parts.append(_RUNTIME_EXTERNSYNC_MEMBER)
+    parts.append(_RUNTIME_CORE)
+    if config.externsync:
+        parts.append(_RUNTIME_EXTERNSYNC_BLOCK)
+    parts.append(_RUNTIME_TAIL)
+    return "".join(parts)
 
 PRELUDE = r"""template <typename Bit, typename Mask>
 class Flags {
@@ -4643,7 +4660,7 @@ def emit_sections(
         "aliases": _emit_aliases(ir, config),
         "constants": _emit_constants(ir, config),
         "enums": _emit_enums(ir, config),
-        "runtime_declarations": PRELUDE + "\n" + RUNTIME,
+        "runtime_declarations": PRELUDE + "\n" + _runtime(config),
         "runtime_implementations": "",
         "structure_extensions": _emit_extensions(ir, config),
         "structs": _emit_structs(ir, config, template),

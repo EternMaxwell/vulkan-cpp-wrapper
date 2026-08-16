@@ -590,6 +590,13 @@ def test_externsync_shared_locks_and_config_option(tmp_path):
     plain_text = plain.read_text(encoding="utf-8")
     assert "externsync_states" not in plain_text
     assert "StateLocks externsync_locks" not in plain_text
+    # The externsync mutex and its locking helpers are gone entirely, not just
+    # unused; only the always-required tracking/user-data mutexes remain.
+    assert "mutable std::shared_mutex externsync" not in plain_text
+    assert "struct StateLockRef" not in plain_text
+    assert "class StateLocks" not in plain_text
+    assert "struct ExternsyncAccess" not in plain_text
+    assert "std::unique_lock access(self->externsync)" not in plain_text
 
     # The CLI flag is equivalent to the config option.
     flagged = tmp_path / "flagged.hpp"
