@@ -615,6 +615,33 @@ def test_externsync_shared_locks_and_config_option(tmp_path):
     assert "externsync_states" not in flagged_text
 
 
+def test_update_descriptor_sets_externsyncs_write_and_copy_dst(tmp_path):
+    headers = Path.home() / "AppData" / "Local" / "Temp" / "Vulkan-Headers"
+    if not headers.is_dir():
+        return
+    output = tmp_path / "wrapper.hpp"
+    assert (
+        run(
+            [
+                "--registry",
+                str(headers / "registry" / "vk.xml"),
+                "--emit", str(ROOT / "templates" / "vulkan-header-only.template.hpp") + ":" + str(output),
+            ]
+        )
+        == 0
+    )
+    generated = output.read_text(encoding="utf-8")
+    impl = generated[generated.index("inline void Device::updateDescriptorSets") :]
+    impl = impl[: impl.index("\n}\n")]
+    # Write dsts come from the command-level annotation
+    # (externsync="maybe:pDescriptorWrites[].dstSet")...
+    assert impl.count("collect(value.dstSet, true, externsync_states)") == 2
+    # ...and copy dsts from the struct-member annotation
+    # (VkCopyDescriptorSet.dstSet has externsync="maybe"). srcSet is only read,
+    # so it gets a shared (non-exclusive) lock instead.
+    assert "collect(value.srcSet, false, externsync_states)" in impl
+
+
 def test_cli_set_and_add_config_overrides(tmp_path):
     output = tmp_path / "wrapper.hpp"
     assert (

@@ -1592,6 +1592,71 @@ def _bound_handle_wrapper_arguments(
     }
 
 
+def _member_lock_lines(
+    span: str,
+    member: str,
+    member_array: bool,
+    is_span: bool,
+    is_optional: bool,
+    exclusive: bool,
+    failure: str,
+    index: int,
+) -> list[str]:
+    """Externsync lock lines for a ``span|member`` struct-member target.
+
+    ``member`` may be prefixed with ``->`` for pointer-style params (output
+    pointers or optional reference wrappers); the loop-value case always uses
+    dot access.
+    """
+    flag = "true" if exclusive else "false"
+    name = f"externsync_{'lock' if exclusive else 'shared'}_{index}"
+    collect = "detail::ExternsyncAccess::collect"
+    arrow, field = ("->", member[2:]) if member.startswith("->") else (".", member)
+    if is_span:
+        if member_array:
+            return [
+                f"for (const auto& value : {span}) {{",
+                f"    for (const auto& handle : value.{field}) {{",
+                f"        auto lock = {collect}(handle, {flag}, externsync_states);",
+                f"        if (!lock) {{\n            {failure}\n        }}",
+                "    }",
+                "}",
+            ]
+        return [
+            f"for (const auto& value : {span}) {{",
+            f"    auto lock = {collect}(value.{field}, {flag}, externsync_states);",
+            f"    if (!lock) {{\n        {failure}\n    }}",
+            "}",
+        ]
+    if is_optional:
+        if member_array:
+            return [
+                f"if ({span}) {{",
+                f"    for (const auto& handle : {span}{arrow}{field}) {{",
+                f"        auto lock = {collect}(handle, {flag}, externsync_states);",
+                f"        if (!lock) {{\n            {failure}\n        }}",
+                "    }",
+                "}",
+            ]
+        return [
+            f"if ({span}) {{",
+            f"    auto lock = {collect}({span}{arrow}{field}, {flag}, externsync_states);",
+            f"    if (!lock) {{\n        {failure}\n    }}",
+            "}",
+        ]
+    if member_array:
+        return [
+            f"for (const auto& handle : {span}{arrow}{field}) {{",
+            f"    auto lock = {collect}(handle, {flag}, externsync_states);",
+            f"    if (!lock) {{\n        {failure}\n    }}",
+            "}",
+        ]
+    return [
+        f"auto {name} = {collect}({span}{arrow}{field}, {flag}, externsync_states);",
+        f"if (!{name}) {{\n    auto& lock = {name};\n    {failure}\n}}",
+    ]
+
+
 def _externsync_lines(
     command: Command,
     receiver: str | None,
@@ -1656,6 +1721,42 @@ def _externsync_lines(
             )
         )
 
+    # Struct-member externsync annotations (e.g. VkCopyDescriptorSet.dstSet,
+    # VkSubmitInfo.pWaitSemaphores) are kept on the member in the registry. Pick
+    # them up whenever the owning struct appears as a command parameter, for
+    # both array-of-struct and single-struct parameters.
+    for param in command.params:
+        struct = _as_struct(ir, param.type)
+        if struct is None:
+            continue
+        if param.direction != "input":
+            continue
+        is_array = bool(_lengths(param))
+        for member in struct.members:
+            if not member.externsync:
+                continue
+            if _type_category(member.type, ir) != "handle":
+                continue
+            field = _struct_member_names(struct).get(member.name, member.name)
+            member_array = member.is_array or member.alt_length is not None
+            suffix = "[]" if member_array else ""
+            accessor = (
+                ""
+                if is_array
+                else (
+                    "->"
+                    if param.direction == "output"
+                    else ("->get()." if param.is_optional else "")
+                )
+            )
+            targets.append(
+                (
+                    f"{_public_param_name(param)}|{accessor}{field}{suffix}",
+                    is_array,
+                    param.is_optional,
+                )
+            )
+
     parent_exclusive = (
         bool(command.implicit_externsync)
         and receiver is not None
@@ -1688,6 +1789,53 @@ def _externsync_lines(
                 param.is_optional,
             )
         )
+    # Struct-member handles without an externsync annotation are read by the
+    # command; give them a shared (non-exclusive) lock so they serialize against
+    # any concurrent exclusive writer on the same handle.
+    for param in command.params:
+        struct = _as_struct(ir, param.type)
+        if struct is None:
+            continue
+        if param.direction != "input":
+            continue
+        is_array = bool(_lengths(param))
+        for member in struct.members:
+            if member.externsync:
+                continue
+            if _type_category(member.type, ir) != "handle":
+                continue
+            field = _struct_member_names(struct).get(member.name, member.name)
+            member_array = member.is_array or member.alt_length is not None
+            suffix = "[]" if member_array else ""
+            accessor = (
+                ""
+                if is_array
+                else (
+                    "->"
+                    if param.direction == "output"
+                    else ("->get()." if param.is_optional else "")
+                )
+            )
+            shared_targets.append(
+                (
+                    f"{_public_param_name(param)}|{accessor}{field}{suffix}",
+                    is_array,
+                    param.is_optional,
+                )
+            )
+    # A member already locked exclusively (command-level or struct-level
+    # externsync) does not also need the shared lock; StateLocks would dedup it
+    # anyway, so drop the redundant entry.
+    exclusive_members = {
+        (expression, is_span)
+        for expression, is_span, _ in targets
+        if "|" in expression
+    }
+    shared_targets = [
+        (expression, is_span, is_optional)
+        for expression, is_span, is_optional in shared_targets
+        if "|" not in expression or (expression, is_span) not in exclusive_members
+    ]
     if (
         not targets
         and not dynamic_targets
@@ -1708,13 +1856,13 @@ def _externsync_lines(
     for index, (expression, is_span, is_optional) in enumerate(targets):
         if "|" in expression:
             span, member = expression.split("|", 1)
+            member_array = member.endswith("[]")
+            if member_array:
+                member = member[:-2]
             lines.extend(
-                [
-                    f"for (const auto& value : {span}) {{",
-                    f"    auto lock = detail::ExternsyncAccess::collect(value.{member}, true, externsync_states);",
-                    f"    if (!lock) {{\n        {failure}\n    }}",
-                    "}",
-                ]
+                _member_lock_lines(
+                    span, member, member_array, is_span, is_optional, True, failure, index
+                )
             )
             continue
         if is_span:
@@ -1769,6 +1917,17 @@ def _externsync_lines(
             ]
         )
     for index, (expression, is_span, is_optional) in enumerate(shared_targets):
+        if "|" in expression:
+            span, member = expression.split("|", 1)
+            member_array = member.endswith("[]")
+            if member_array:
+                member = member[:-2]
+            lines.extend(
+                _member_lock_lines(
+                    span, member, member_array, is_span, is_optional, False, failure, index
+                )
+            )
+            continue
         if is_span:
             lines.extend(
                 [
